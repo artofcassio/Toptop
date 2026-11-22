@@ -193,7 +193,7 @@ def test_coarse_circle_keeps_vertex_fidelity_but_has_chord_error():
     sagitta = (1.0 - math.cos(math.pi / 16)) / report.diagonal
     assert report.crease_coverage == pytest.approx(1.0)
     assert report.feature_fidelity == pytest.approx(0.0, abs=1e-9)
-    assert report.feature_chord_dev == pytest.approx(sagitta, rel=0.02)
+    assert report.feature_chord_dev == pytest.approx(sagitta, rel=0.03)
     assert report.hausdorff == pytest.approx(sagitta, rel=1e-6)
     assert report.corners_total == 0
 
@@ -251,3 +251,24 @@ def test_heat_colors():
     assert colors[0] == pytest.approx([0.0, 0.2, 1.0])
     assert colors[2] == pytest.approx([1.0, 0.0, 0.0]) and colors[3] == pytest.approx([1.0, 0.0, 0.0])
     assert colors.shape == (4, 3) and (colors >= 0).all() and (colors <= 1).all()
+
+
+def _plane_with_lines(xs):
+    """Plano 1x1 com uma coluna de quads entre cada par de x; devolve também as linhas internas."""
+    xs = np.asarray(xs, dtype=float)
+    pts = [(x, y, 0.0) for x in xs for y in (0.0, 1.0)]
+    faces = [(2 * i, 2 * i + 2, 2 * i + 3, 2 * i + 1) for i in range(len(xs) - 1)]
+    inner = np.array([[2 * i, 2 * i + 1] for i in range(1, len(xs) - 1)])
+    return Mesh.from_faces(pts, faces), inner
+
+
+def test_thin_wall_each_crease_needs_its_own_loop():
+    """Duas creases mais próximas que a tolerância: um loop só cobre a mais próxima."""
+    ref, inner = _plane_with_lines([0.0, 0.5, 0.504, 1.0])  # 0,28% da diagonal entre as duas
+    feats = FeatureSet(inner)
+    both, _ = _plane_with_lines([0.0, 0.25, 0.5, 0.504, 0.75, 1.0])
+    assert evaluate(both, ref, feats).crease_coverage_strong == pytest.approx(1.0)
+    one, _ = _plane_with_lines([0.0, 0.25, 0.5, 0.75, 1.0])
+    report = evaluate(one, ref, feats)
+    assert report.crease_coverage_strong == pytest.approx(0.5)
+    assert report.checks["crease_coverage"] is False

@@ -146,14 +146,15 @@ def match_features(
     ela está alinhada (até ``align_deg``) com a crease mais próxima. A partir
     daí saem:
 
-    * ``coverage``: fração do comprimento de crease que tem um loop desses ao
-      lado e na mesma direção, até ``sample_align_deg`` (``coverage_strong``
-      olha só as creases fortes);
+    * ``coverage``: fração do comprimento de crease coberta por um loop desses,
+      contando só o loop que tem essa crease como a mais próxima e corre na
+      direção dela, até ``sample_align_deg`` (``coverage_strong`` olha só as
+      creases fortes);
     * ``vertex_dev``: maior distância dos vértices desses loops até a crease;
     * ``corner_dev``: maior distância de um canto original até o vértice novo
       mais próximo (pega quina arredondada ou cortada);
-    * ``chord_dev``: maior distância da crease até o loop (inclui a flecha das
-      cordas em creases curvas; só informativo).
+    * ``chord_dev``: maior distância do loop até a crease, medida ao longo das
+      arestas (inclui a flecha das cordas em creases curvas; só informativo).
     """
     num_new = new_mesh.num_points
     empty_mask = np.zeros(num_new, dtype=bool)
@@ -203,30 +204,44 @@ def match_features(
     strong_loop_vertex = np.zeros(num_new, dtype=bool)
     strong_loop_vertex[matched[matched_strong].reshape(-1)] = True
 
-    # 2. cobertura: amostras ao longo das creases originais
+    # 2. cobertura: cada crease é dividida em trechos de tamanho ``spacing``; um
+    # trecho está coberto quando alguma amostra de um loop novo tem ESSA crease
+    # como a mais próxima (em chapa fina, o loop de cima não cobre a crease de
+    # baixo) e o loop corre na direção dela (a borda onde a crease termina
+    # cruza, não cobre)
     spacing = max(spacing_rel * diagonal, total_len / max_samples)
-    samples, sample_seg, sample_len = sample_segments(seg_a, seg_b, spacing)
-    covered = np.zeros(len(samples), dtype=bool)
+    buckets = np.maximum(1, np.ceil(seg_len / spacing)).astype(np.int64)
+    bucket_start = np.cumsum(buckets) - buckets
+    bucket_seg = np.repeat(np.arange(len(buckets)), buckets)
+    bucket_len = (seg_len / buckets)[bucket_seg]
+    covered = np.zeros(int(buckets.sum()), dtype=bool)
     chord_dev: float | None = None
     if len(matched):
         new_a, new_b = verts[matched[:, 0]], verts[matched[:, 1]]
-        dist_s, edge_s, _, _ = PrimitiveGrid(np.stack([new_a, new_b], axis=1)).query(samples, max_dist=tol)
-        # o loop tem de acompanhar a crease da própria amostra: uma aresta que só
-        # cruza a crease (por exemplo, a borda onde ela termina) não cobre nada
-        edge_safe = np.maximum(edge_s, 0)
-        loop_dir = (new_b - new_a)[edge_safe]
-        own_dir = (seg_b - seg_a)[sample_seg]
-        denom = np.linalg.norm(loop_dir, axis=1) * seg_len[sample_seg]
-        cosine = np.abs(np.einsum("ij,ij->i", loop_dir, own_dir)) / np.where(denom > 0, denom, 1.0)
-        covered = (edge_s >= 0) & (dist_s <= tol) & (cosine >= math.cos(math.radians(sample_align_deg)))
-        if covered.any():
-            chord_dev = float(dist_s[covered].max())
-    coverage = float((sample_len * covered).sum() / total_len)
-    sample_strong = strong[sample_seg]
-    strong_len = float(sample_len[sample_strong].sum())
+        loop_pts, loop_edge, _ = sample_segments(new_a, new_b, 0.5 * spacing)
+        dist_l, seg_l, foot, _ = ref_grid.query(loop_pts, max_dist=tol)
+        seg_safe = np.maximum(seg_l, 0)
+        loop_dir = (new_b - new_a)[loop_edge]
+        ref_dir = (seg_b - seg_a)[seg_safe]
+        denom = np.linalg.norm(loop_dir, axis=1) * seg_len[seg_safe]
+        cosine = np.abs(np.einsum("ij,ij->i", loop_dir, ref_dir)) / np.where(denom > 0, denom, 1.0)
+        credit = (seg_l >= 0) & (cosine >= math.cos(math.radians(sample_align_deg)))
+        if credit.any():
+            seg_c = seg_safe[credit]
+            along = np.linalg.norm(foot[credit] - seg_a[seg_c], axis=1) / seg_len[seg_c]
+            local = np.minimum((along * buckets[seg_c]).astype(np.int64), buckets[seg_c] - 1)
+            covered[bucket_start[seg_c] + local] = True
+            chord_dev = float(dist_l[credit].max())
+    coverage = float(bucket_len[covered].sum() / total_len)
+    bucket_strong = strong[bucket_seg]
+    strong_len = float(bucket_len[bucket_strong].sum())
     coverage_strong = (
-        float((sample_len * covered)[sample_strong].sum() / strong_len) if strong_len > 0 else None
+        float(bucket_len[covered & bucket_strong].sum() / strong_len) if strong_len > 0 else None
     )
+    missing = np.flatnonzero(~covered)
+    miss_seg = bucket_seg[missing]
+    miss_t = ((missing - bucket_start[miss_seg] + 0.5) / buckets[miss_seg])[:, None]
+    uncovered_points = seg_a[miss_seg] + (seg_b - seg_a)[miss_seg] * miss_t
 
     vertex_dev = float(dist_v[loop_vertex].max()) if loop_vertex.any() else None
 
@@ -262,7 +277,7 @@ def match_features(
         loop_vertex=loop_vertex,
         strong_loop_vertex=strong_loop_vertex,
         near_corner=near_corner,
-        uncovered_points=samples[~covered],
+        uncovered_points=uncovered_points,
     )
 
 
