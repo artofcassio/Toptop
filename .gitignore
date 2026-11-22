@@ -1,0 +1,22 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Motores de terceiros (binários baixados pelo usuário; nunca versionados)
+third_party/
+
+# Saídas das execuções
+tests/output/
+phase0_results.csv
+phase0_results.json
+*.swatches
+
+# Modelos gerados por tests/make_test_models.py (pesados; gere localmente)
+tests/models/*.mb
+tests/models/*.ma
+tests/models/*.obj
+tests/models/*.feat
+tests/models/*.json
