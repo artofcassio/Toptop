@@ -134,9 +134,13 @@ class QuadRemesherEngine(Engine):
         """Só no Maya com interface e com o módulo do plugin importável."""
         try:
             from maya import cmds
+
+            batch = bool(cmds.about(batch=True))
         except ImportError:
             return False, "o Quad Remesher só roda dentro do Maya"
-        if cmds.about(batch=True) and not self.allow_batch:
+        except Exception:  # mayapy antes do maya.standalone.initialize(): sem comandos
+            batch = True
+        if batch and not self.allow_batch:
             return False, (
                 "o Quad Remesher é de uso manual: rode pela janela do Maya e grave o resultado com "
                 "toptop.engine.quadremesher.collect_manual (veja HANDOFF_NEXT.md)"

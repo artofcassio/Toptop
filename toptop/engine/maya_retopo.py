@@ -86,6 +86,8 @@ class MayaRetopoEngine(Engine):
             from maya import cmds
         except ImportError:
             return False, "o Retopologize só roda dentro do Maya (use o mayapy)"
+        if not hasattr(cmds, "about"):
+            return False, "o Maya não foi iniciado (falta maya.standalone.initialize())"
         if not hasattr(cmds, "polyRetopo"):
             return False, "esta versão do Maya não tem o comando polyRetopo"
         return True, "comando polyRetopo"

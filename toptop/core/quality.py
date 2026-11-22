@@ -490,12 +490,14 @@ def evaluate(
     match_tol_rel: float = 0.01,
     name: str = "",
     engine: str = "",
+    details: dict[str, Any] | None = None,
 ) -> QualityReport:
     """Mede a malha nova contra a original e devolve o relatório completo.
 
     ``features`` são as creases da malha **original** (pares de vértices dela).
     Com ``include_boundary``, as bordas abertas da original entram como feature
-    de nível guia, como no pipeline.
+    de nível guia, como no pipeline. Se ``details`` for um dicionário, ele
+    recebe ``"match"`` (o ``FeatureMatch``, útil para desenhar os loops).
     """
     targets = targets or Targets()
     report = QualityReport(name=name or new_mesh.name, engine=engine, time_s=time_s)
@@ -544,6 +546,8 @@ def evaluate(
         match = match_features(
             new_mesh, ref_mesh.points, feats, diagonal, strong_threshold, match_tol_rel=match_tol_rel
         )
+        if details is not None:
+            details["match"] = match
         if match.applicable:
             report.feature_length = match.feature_length
             report.crease_coverage = match.coverage
