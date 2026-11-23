@@ -5,7 +5,10 @@ Uso (Windows, na raiz do repositório):
     mayapy tests\\make_test_models.py
     mayapy tests\\make_test_models.py --only 01,04 --out tests\\models
 
-Também roda dentro do Maya: ``import make_test_models; make_test_models.main([])``.
+Também roda dentro do Maya com interface (``import make_test_models;
+make_test_models.main([])``), mas cada modelo começa numa cena nova: salve a
+sua cena antes (com alterações não salvas o script se recusa a rodar, a menos
+que receba ``--force``).
 
 Para cada modelo grava em ``tests/models``:
 
@@ -117,20 +120,34 @@ def finish(node):
     return node
 
 
-def edges_where(node, predicate, min_angle=None):
-    """Componentes das arestas cujas duas pontas satisfazem ``predicate(pontos)``."""
+def edges_where(node, predicate, min_angle=None, axis=None):
+    """Componentes das arestas cujo ponto médio satisfaz ``predicate(pontos)``.
+
+    O teste é feito na aresta (ponto médio), não em cada ponta: numa caixa sem
+    divisões todos os cantos satisfazem "|x| = 6 e |z| = 4", mas só as arestas
+    verticais têm o ponto médio ali. ``axis`` (0, 1 ou 2) deixa só as arestas
+    paralelas a esse eixo. Levanta erro se nada for encontrado: um comando
+    ``poly*`` com lista vazia age sobre a seleção atual.
+    """
+    import numpy as np
+
     from toptop import maya_bridge
     from toptop.core.creases import dihedral_angles
 
     mesh = maya_bridge.mesh_from_maya(node)
     edges = mesh.topology.edges
-    keep = predicate(mesh.points[edges[:, 0]]) & predicate(mesh.points[edges[:, 1]])
+    a, b = mesh.points[edges[:, 0]], mesh.points[edges[:, 1]]
+    keep = np.asarray(predicate(0.5 * (a + b)), dtype=bool)
+    if axis is not None:
+        others = [i for i in range(3) if i != axis]
+        keep &= (np.abs(b - a)[:, others] < 1e-6).all(axis=1)
     if min_angle is not None:
-        import numpy as np
-
         with np.errstate(invalid="ignore"):
             keep &= dihedral_angles(mesh) > min_angle
-    return maya_bridge.edge_components(node, edges[keep])
+    components = maya_bridge.edge_components(node, edges[keep])
+    if not components:
+        raise RuntimeError(f"nenhuma aresta encontrada em {node} para o filtro pedido")
+    return components
 
 
 def mark_creases(node, angle=30.0, guide_planes=()):
@@ -256,7 +273,7 @@ def model_04_chanfros_fillets():
 
     cmds = _cmds()
     node = box("chanfros_fillets", (12, 6, 8))
-    vertical = edges_where(node, lambda p: (np.abs(np.abs(p[:, 0]) - 6) < 1e-4) & (np.abs(np.abs(p[:, 2]) - 4) < 1e-4))
+    vertical = edges_where(node, lambda p: (np.abs(np.abs(p[:, 0]) - 6) < 1e-4) & (np.abs(np.abs(p[:, 2]) - 4) < 1e-4), axis=1)
     cmds.polyBevel3(vertical, offset=1.2, offsetAsFraction=False, segments=6, depth=1, chamfer=True, ch=False)
     cmds.delete(node, ch=True)
     top = edges_where(node, lambda p: np.abs(p[:, 1] - 3) < 1e-4, min_angle=60.0)
@@ -328,7 +345,7 @@ def model_09_500k_faces():
 
     cmds = _cmds()
     body = box("denso_base", (20, 12, 16))
-    vertical = edges_where(body, lambda p: (np.abs(np.abs(p[:, 0]) - 10) < 1e-4) & (np.abs(np.abs(p[:, 2]) - 8) < 1e-4))
+    vertical = edges_where(body, lambda p: (np.abs(np.abs(p[:, 0]) - 10) < 1e-4) & (np.abs(np.abs(p[:, 2]) - 8) < 1e-4), axis=1)
     cmds.polyBevel3(vertical, offset=2.0, offsetAsFraction=False, segments=8, depth=1, chamfer=True, ch=False)
     cmds.delete(body, ch=True)
     cutters = [cylinder(f"furo{i}", 1.5, 16, 32, (-5 + 10 * i, 0, 0)) for i in range(2)]
@@ -386,9 +403,9 @@ def export_model(node, name, title, options, out_dir):
     node = cmds.rename(node, name)
     strong, guide = mark_creases(node, options.get("angle", 30.0), options.get("guide_planes", ()))
 
-    scene = os.path.join(out_dir, name + ".mb")
+    scene = os.path.abspath(os.path.join(out_dir, name + ".mb"))
     cmds.select(node, replace=True)
-    cmds.file(rename=scene)
+    cmds.file(rename=scene.replace("\\", "/"))  # caminho absoluto: relativo iria para o projeto do Maya
     cmds.file(save=True, type="mayaBinary", force=True)
 
     features = maya_read_creases(node)
@@ -418,41 +435,101 @@ def export_model(node, name, title, options, out_dir):
     return spec, extra
 
 
+def _manifest_item(spec, extra, out_dir):
+    """Entrada do ``models.json`` para um modelo recém-gerado."""
+    from dataclasses import asdict
+
+    item = asdict(spec)
+    item["obj"] = os.path.relpath(spec.obj, out_dir).replace(os.sep, "/")
+    item["features"] = os.path.relpath(spec.features, out_dir).replace(os.sep, "/")
+    item.update(extra)
+    return item
+
+
+def _previous_items(out_dir):
+    """Entradas do manifesto anterior, inteiras (com todos os campos extras).
+
+    Sem manifesto, usa os ``.obj`` que já estiverem na pasta.
+    """
+    import json
+    from dataclasses import asdict
+
+    from toptop.core import phase0
+
+    path = os.path.join(out_dir, phase0.MANIFEST)
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                return {item["name"]: item for item in json.load(handle).get("models", [])}
+        except (OSError, ValueError, KeyError) as error:
+            print(f"AVISO: manifesto anterior ilegível ({error}); ele será refeito.")
+    items = {}
+    for spec in phase0.load_models(out_dir):
+        item = asdict(spec)
+        item["obj"] = os.path.basename(spec.obj)
+        item["features"] = os.path.basename(spec.features)
+        items[spec.name] = item
+    return items
+
+
+def _write_manifest(out_dir, items):
+    """Grava o ``models.json`` na ordem da lista ``MODELS`` (outros nomes no fim)."""
+    import json
+
+    from toptop.core import phase0
+
+    order = [name for name, _, _ in MODELS]
+    names = [n for n in order if n in items] + sorted(n for n in items if n not in order)
+    path = os.path.join(out_dir, phase0.MANIFEST)
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump({"version": 1, "models": [items[n] for n in names]}, handle, indent=2, ensure_ascii=False)
+    return path
+
+
 def main(argv=None):
     """Gera os modelos pedidos e o ``models.json``."""
     parser = argparse.ArgumentParser(description="Gera os 10 modelos de teste da Fase 0.")
     parser.add_argument("--out", default=os.path.join(REPO, "tests", "models"), help="pasta de saída")
     parser.add_argument("--only", default="", help="só os modelos cujo nome contém um destes trechos (vírgula)")
+    parser.add_argument("--force", action="store_true", help="no Maya com interface, descarta a cena aberta sem perguntar")
     args = parser.parse_args(argv)
-
-    from toptop.core import phase0
+    args.out = os.path.abspath(args.out)
 
     cmds = _cmds()
+    interactive = not cmds.about(batch=True)
+    if interactive and cmds.file(query=True, modified=True) and not args.force:
+        print("A cena aberta tem alterações não salvas. Salve-a (cada modelo começa numa cena nova) "
+              "ou rode pelo mayapy; para descartar mesmo assim use --force.")  # fmt: skip
+        return 2
+
     os.makedirs(args.out, exist_ok=True)
     wanted = [part.strip() for part in args.only.split(",") if part.strip()]
-    specs, extras, failures = [], {}, []
-    # mantém no manifesto os modelos já gerados que não estão sendo refeitos agora
-    previous = {spec.name: spec for spec in phase0.load_models(args.out)} if os.path.isfile(
-        os.path.join(args.out, phase0.MANIFEST)) else {}  # fmt: skip
-    for name, title, builder in MODELS:
-        if wanted and not any(part in name for part in wanted):
-            if name in previous:
-                specs.append(previous[name])
-            continue
-        print(f"Gerando {name} ({title}) ...")
-        try:
-            cmds.file(new=True, force=True)
-            node, options = builder()
-            spec, extra = export_model(node, name, title, options, args.out)
-            specs.append(spec)
-            extras[name] = extra
-        except Exception as error:
-            failures.append((name, f"{error}"))
-            print(f"  FALHOU: {error}")
-            traceback.print_exc()
-    manifest = phase0.write_manifest(args.out, specs, extras)
+    # o manifesto anterior é mantido: modelos não refeitos (ou que falharem agora)
+    # continuam com todos os seus campos
+    items = _previous_items(args.out)
+    failures, done = [], 0
+    try:
+        for name, title, builder in MODELS:
+            if wanted and not any(part in name for part in wanted):
+                continue
+            print(f"Gerando {name} ({title}) ...")
+            try:
+                cmds.file(new=True, force=True)
+                node, options = builder()
+                spec, extra = export_model(node, name, title, options, args.out)
+                items[name] = _manifest_item(spec, extra, args.out)
+                done += 1
+            except Exception as error:
+                failures.append((name, f"{error}"))
+                print(f"  FALHOU: {error}")
+                traceback.print_exc()
+            _write_manifest(args.out, items)  # a cada modelo: um crash não perde o que já foi feito
+    finally:
+        if interactive:
+            cmds.file(new=True, force=True)  # não deixa a sessão apontando para o último .mb de teste
+    manifest = _write_manifest(args.out, items)
     print()
-    print(f"{len(specs)} modelo(s) em {args.out}; manifesto: {manifest}")
+    print(f"{done} modelo(s) gerado(s); {len(items)} no manifesto {manifest}")
     for name, message in failures:
         print(f"  não gerado: {name}: {message}")
     return 1 if failures else 0
@@ -461,7 +538,15 @@ def main(argv=None):
 if __name__ == "__main__":
     import maya.standalone
 
-    maya.standalone.initialize(name="python")
-    code = main()
-    sys.stdout.flush()
-    os._exit(code)
+    for _stream in (sys.stdout, sys.stderr):  # acentos num console cp1252
+        try:
+            _stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+    code = 1
+    try:
+        maya.standalone.initialize(name="python")
+        code = main()
+    finally:
+        sys.stdout.flush()
+        os._exit(code)  # o encerramento normal do Maya standalone às vezes trava

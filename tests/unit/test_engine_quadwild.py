@@ -240,3 +240,29 @@ def test_real_quadwild_on_a_cube(tmp_path):
     assert report.quad_ratio == 1.0 and Density(600).accepts(report.quads)
     assert report.crease_coverage > 0.99 and report.hausdorff < 0.005
     assert report.corners_matched == 8
+
+
+@posix_only
+def test_process_stuck_after_writing_everything_is_ended(tmp_path):
+    """Saída completa e processo pendurado: encerra e usa o resultado, sem tempo limite."""
+    install = _fake_install(str(tmp_path / "qw"), mode="hang_after_output", quads_at_scale_one=42)
+    engine = qw.QuadWildEngine(install_dir=install, workdir_root=str(tmp_path), timeout_s=50, done_grace_s=0.4)
+    start = time.monotonic()
+    result = engine.remesh(shapes.cube(3), None, 100)
+    assert time.monotonic() - start < 20
+    assert result.num_faces > 0 and engine.last_run.details["exit_trace"] == qw.KILLED_AFTER_DONE
+    assert "não terminou" in engine.last_run.details["warning"]
+
+
+def test_stable_file(tmp_path):
+    from toptop.engine.base import stable_file
+
+    path = tmp_path / "saida.json"
+    check = stable_file(str(path))
+    assert check() is False  # não existe
+    path.write_text("{")
+    assert check() is False  # acabou de aparecer
+    assert check() is True  # mesmo tamanho na segunda olhada
+    path.write_text("{}")
+    assert check() is False  # cresceu
+    assert check() is True

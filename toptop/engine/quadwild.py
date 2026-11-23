@@ -50,6 +50,7 @@ from .base import (
     Density,
     Engine,
     EngineError,
+    KILLED_AFTER_DONE,
     EngineUnavailable,
     ProgressFn,
     RunInfo,
@@ -57,6 +58,7 @@ from .base import (
     as_feature_pairs,
     read_log_tail,
     run_process,
+    stable_file,
 )
 
 INSTALL_ENV = "TOPTOP_QUADWILD_DIR"
@@ -246,6 +248,7 @@ class QuadWildEngine(Engine):
         normalized_diagonal: float = 100.0,
         engine_detects_features: bool = False,
         workdir_root: str | None = None,
+        done_grace_s: float = 5.0,
     ) -> None:
         """Parâmetros.
 
@@ -257,6 +260,10 @@ class QuadWildEngine(Engine):
         ``density_passes``: quantas quadrangulações no máximo para acertar a
         densidade. ``engine_detects_features``: ignora as creases dadas e deixa
         o motor detectar por ``sharp_angle`` (só para comparação).
+        ``done_grace_s``: depois que o último arquivo de um passo aparece e para
+        de crescer, quantos segundos esperar o processo terminar sozinho antes
+        de encerrá-lo (um crash na saída pode deixá-lo preso atrás da caixa de
+        erro do Windows, porque o motor chama ``SetErrorMode(0)``).
         """
         super().__init__(timeout_s)
         self.install_dir = install_dir
@@ -269,6 +276,7 @@ class QuadWildEngine(Engine):
         self.normalized_diagonal = normalized_diagonal
         self.engine_detects_features = engine_detects_features
         self.workdir_root = workdir_root
+        self.done_grace_s = float(done_grace_s)
 
     def availability(self) -> tuple[bool, str]:
         """Procura os executáveis; a mensagem diz onde colocá-los se faltarem."""
@@ -335,9 +343,17 @@ class QuadWildEngine(Engine):
         info = RunInfo(workdir=workdir)
         self.last_run = info
 
-        def run(exe: str, args: list[str]) -> int:
+        def run(exe: str, args: list[str], last_output: str) -> int:
             remaining = deadline - time.monotonic()
-            return run_process([os.path.join(install, exe)] + args, workdir, log_path, max(remaining, 0.0), cancel)
+            return run_process(
+                [os.path.join(install, exe)] + args,
+                workdir,
+                log_path,
+                max(remaining, 0.0),
+                cancel,
+                done=stable_file(os.path.join(workdir, last_output)),
+                done_grace_s=self.done_grace_s,
+            )
 
         def need(filename: str, stage: str) -> str:
             path = os.path.join(workdir, filename)
@@ -368,7 +384,8 @@ class QuadWildEngine(Engine):
             template = self._template(install)
 
             report(0.05, "QuadWild: remesh, campo e traçado")
-            info.details["exit_trace"] = run(QUADWILD_EXE, args)
+            # o último arquivo que o passo 1 grava (conferido numa execução real)
+            info.details["exit_trace"] = run(QUADWILD_EXE, args, "mesh_rem_p0.c_feature")
             for suffix in (".patch", ".corners", ".feature", ".c_feature"):
                 need("mesh_rem_p0" + suffix, "passo 1: traçado")
             remeshed = read_obj(need("mesh_rem_p0.obj", "passo 1: traçado"))
@@ -382,8 +399,11 @@ class QuadWildEngine(Engine):
                 report(0.6 + 0.35 * attempt / self.density_passes, "QuadWild: quadrangulação")
                 with open(os.path.join(workdir, "main.txt"), "w", encoding="ascii", newline="\n") as handle:
                     handle.write(main_config_text(template, scale))
+                # stats_<n>.json é a última coisa que o passo 2 grava
                 info.details["exit_quads"] = run(
-                    PATCHES_EXE, ["mesh_rem_p0.obj", str(attempt), "main.txt", f"stats_{attempt}.json"]
+                    PATCHES_EXE,
+                    ["mesh_rem_p0.obj", str(attempt), "main.txt", f"stats_{attempt}.json"],
+                    f"stats_{attempt}.json",
                 )
                 stem = f"mesh_rem_p0_{attempt}_quadrangulation"
                 result = read_obj(need(stem + ".obj", "passo 2: quadrangulação"))
@@ -397,7 +417,12 @@ class QuadWildEngine(Engine):
                         info.details["smooth_missing"] = True
                     else:
                         result = smooth
-                if info.details["exit_quads"] != 0:
+                if info.details["exit_quads"] == KILLED_AFTER_DONE:
+                    info.details["warning"] = (
+                        "quad_from_patches gravou a saída completa mas não terminou (crash com a caixa "
+                        "de erro do Windows aberta?); o processo foi encerrado"
+                    )
+                elif info.details["exit_quads"] != 0:
                     # visto no binário Linux v0.0.2: falha de segmentação ao sair,
                     # depois de gravar todos os arquivos
                     info.details["warning"] = (

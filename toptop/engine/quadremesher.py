@@ -72,6 +72,29 @@ def _mesh_transforms() -> set[str]:
     return set(cmds.listRelatives(shapes, parent=True, fullPath=True) or [])
 
 
+def _pump_events() -> None:
+    """Deixa o Maya e o Qt processarem eventos enquanto esperamos o plugin.
+
+    ``cmds.refresh`` só redesenha a viewport; um plugin que termina por timer,
+    ``evalDeferred``/``executeDeferred`` ou scriptJob de idle precisa que a fila
+    de idle do Maya e os eventos do Qt rodem.
+    """
+    try:
+        import maya.utils
+
+        maya.utils.processIdleEvents()
+    except Exception:
+        pass
+    try:
+        from PySide6 import QtWidgets
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.processEvents()
+    except Exception:
+        pass
+
+
 def prepare_manual(mesh: Mesh, feature_edges: "FeatureSet | np.ndarray | None", target_quads: int, name: str) -> str:
     """Põe o modelo na cena pronto para o Quad Remesher manual; devolve o transform.
 
@@ -218,9 +241,12 @@ class QuadRemesherEngine(Engine):
                 if cancel is not None and cancel():
                     raise EngineCancelled("execução cancelada pelo usuário")
                 if time.monotonic() > deadline:
-                    raise EngineTimeout(f"o Quad Remesher não criou malha em {self.timeout_s:.0f} s")
-                cmds.refresh()
-                time.sleep(0.25)
+                    raise EngineTimeout(
+                        f"o Quad Remesher não criou malha em {self.timeout_s:.0f} s; se ele terminar depois, "
+                        "apague à mão a malha que aparecer"
+                    )
+                _pump_events()
+                time.sleep(0.1)
             result = maya_bridge.mesh_from_maya(sorted(created)[0], world=True)
         except EngineError:
             raise

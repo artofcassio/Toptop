@@ -151,6 +151,28 @@ class Engine(ABC):
         """
 
 
+#: código devolvido por ``run_process`` quando a saída ficou completa mas o
+#: processo não terminou sozinho e foi encerrado
+KILLED_AFTER_DONE = -1000
+
+
+def stable_file(path: str) -> Callable[[], bool]:
+    """Teste para ``run_process(done=...)``: o arquivo existe e parou de crescer."""
+    last: list[int] = [-1]
+
+    def check() -> bool:
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            last[0] = -1
+            return False
+        same = size > 0 and size == last[0]
+        last[0] = size
+        return same
+
+    return check
+
+
 def run_process(
     command: Sequence[str],
     cwd: str,
@@ -159,11 +181,18 @@ def run_process(
     cancel: CancelFn | None = None,
     poll_s: float = 0.1,
     env: dict[str, str] | None = None,
+    done: Callable[[], bool] | None = None,
+    done_grace_s: float = 5.0,
 ) -> int:
     """Roda um processo filho com tempo limite e cancelamento.
 
     A saída (stdout + stderr) vai para ``log_path``. Devolve o código de saída;
     levanta ``EngineTimeout`` ou ``EngineCancelled`` depois de matar o processo.
+
+    ``done``: teste de "saída completa". Se ele ficar verdadeiro e o processo
+    não terminar em ``done_grace_s`` segundos (por exemplo, preso atrás da caixa
+    de erro do Windows depois de um crash na saída), o processo é encerrado e a
+    função devolve ``KILLED_AFTER_DONE``.
     """
     flags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
     deadline = time.monotonic() + timeout_s
@@ -182,11 +211,21 @@ def run_process(
             )
         except OSError as error:
             raise EngineError(f"não foi possível iniciar {command[0]}: {error}") from error
+        done_since: float | None = None
         try:
             while True:
                 code = proc.poll()
                 if code is not None:
                     return code
+                if done is not None:
+                    if done():
+                        if done_since is None:
+                            done_since = time.monotonic()
+                        elif time.monotonic() - done_since >= done_grace_s:
+                            log.write(b"\n[toptop] saida completa; processo encerrado por nao terminar\n")
+                            return KILLED_AFTER_DONE
+                    else:
+                        done_since = None
                 if cancel is not None and cancel():
                     raise EngineCancelled("execução cancelada pelo usuário")
                 if time.monotonic() > deadline:

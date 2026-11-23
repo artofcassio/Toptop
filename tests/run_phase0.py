@@ -180,9 +180,11 @@ def run_in_worker(spec: phase0.ModelSpec, engine: str, args: argparse.Namespace)
         json.dump(job, handle)
     start = time.perf_counter()
     with open(stem + ".log.txt", "wb") as log:
+        # log do filho em UTF-8 (o pai o lê assim); caminhos já são absolutos
+        env = {**os.environ, "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8"}
         proc = subprocess.Popen(
-            [mayapy, os.path.abspath(__file__), "--worker", stem + ".job.json"],
-            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=REPO,
+            [mayapy, os.path.abspath(__file__), "--worker", os.path.abspath(stem + ".job.json")],
+            stdout=log, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, cwd=REPO, env=env,
         )  # fmt: skip
         try:
             proc.wait(timeout=args.timeout + WORKER_MARGIN_S)
@@ -233,12 +235,45 @@ def selftest_models(folder: str) -> str:
     return folder
 
 
+def save_results(rows: list[dict], args: argparse.Namespace) -> bool:
+    """Grava JSON e CSV; um arquivo aberto no Excel só gera aviso, não derruba o lote."""
+    ok = True
+    targets = (
+        ("phase0_results.json", lambda path: phase0.write_json(rows, path)),  # primeiro: o --append lê este
+        ("phase0_results.csv", lambda path: phase0.write_csv(rows, path, args.excel_br)),
+    )
+    for name, write in targets:
+        path = os.path.join(args.out, name)
+        try:
+            write(path)
+        except OSError as error:
+            ok = False
+            print(f"AVISO: não consegui gravar {path} ({error}). Se ele estiver aberto no Excel, feche; "
+                  "tento de novo no próximo passo.")  # fmt: skip
+    return ok
+
+
+def safe_console() -> None:
+    """Saída que não quebra com acentos num console ou arquivo em cp1252."""
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.reconfigure(errors="replace")
+        except (AttributeError, ValueError):
+            pass
+
+
 def main(argv: list[str] | None = None) -> int:
     """Ponto de entrada."""
+    safe_console()
     args = parse_args(argv)
     if args.worker:
         worker_main(args.worker)
         return 0
+    # o processo do Maya roda com outra pasta atual: tudo vira caminho absoluto
+    args.out = os.path.abspath(args.out)
+    args.models_dir = os.path.abspath(args.models_dir)
+    if args.quadwild_dir:
+        args.quadwild_dir = os.path.abspath(args.quadwild_dir)
     os.makedirs(args.out, exist_ok=True)
     if args.selftest:
         args.models_dir = selftest_models(os.path.join(args.out, "selftest_models"))
@@ -288,9 +323,10 @@ def main(argv: list[str] | None = None) -> int:
             print(f"    {verdict}  ({time.perf_counter() - start:.1f} s no total)"
                   + (f"  {str(row['message']).splitlines()[0][:150]}" if row.get("message") else ""), flush=True)  # fmt: skip
             # grava a cada passo: se o lote for interrompido, o que já rodou fica
-            phase0.write_csv(rows, os.path.join(args.out, "phase0_results.csv"), args.excel_br)
-            phase0.write_json(rows, os.path.join(args.out, "phase0_results.json"))
+            save_results(rows, args)
 
+    if not save_results(rows, args):
+        print("AVISO: os resultados não foram gravados; feche os arquivos e rode de novo com --append.")
     print()
     print(phase0.summary_text(rows))
     print()
@@ -301,8 +337,13 @@ def main(argv: list[str] | None = None) -> int:
 
 
 if __name__ == "__main__":
-    code = main()
-    if have_maya() and getattr(init_maya, "done", False):
-        sys.stdout.flush()
-        os._exit(code)
+    code = 1
+    try:
+        code = main()
+    finally:
+        # o encerramento normal do Maya standalone às vezes trava: sai direto
+        if have_maya() and getattr(init_maya, "done", False):
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(code)
     sys.exit(code)

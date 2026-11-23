@@ -42,6 +42,8 @@ def fake_install(folder, mode="ok", quads_at_scale_one=400):
         open("mesh_rem_p0.obj", "w").write(open("mesh.obj").read())
         for ext in (".patch", ".corners", ".feature", ".c_feature"):
             open("mesh_rem_p0" + ext, "w").write("1\\n")
+        if MODE == "hang_after_output":
+            time.sleep(60)  # como um crash preso atrás da caixa de erro do Windows
         """
     )
     patches = shebang + textwrap.dedent(
@@ -73,9 +75,13 @@ def fake_install(folder, mode="ok", quads_at_scale_one=400):
             text = "\\n".join(out[: len(out) - 3]) + "\\n"
         if MODE != "no_smooth":
             open(stem + "_smooth.obj", "w").write(text)
+        open("stats_%s.json" % num, "w").write("{{}}")
         print("fake quad_from_patches", scale, n * n)
         if MODE == "crash_at_exit":
             os._exit(139)
+        if MODE == "hang_after_output":
+            import time
+            time.sleep(60)
         """
     )
     for name, body in ((qw.QUADWILD_EXE, trace), (qw.PATCHES_EXE, patches)):
