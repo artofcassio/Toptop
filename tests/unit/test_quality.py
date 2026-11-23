@@ -272,3 +272,18 @@ def test_thin_wall_each_crease_needs_its_own_loop():
     report = evaluate(one, ref, feats)
     assert report.crease_coverage_strong == pytest.approx(0.5)
     assert report.checks["crease_coverage"] is False
+
+
+def test_dense_mesh_does_not_take_the_neighbor_loop_for_the_crease():
+    """Malha densa sem loop na crease: o loop paralelo, a meia aresta, não conta."""
+    ref, mid = _plane_with_crease()  # crease em x = 0,5
+    feats = FeatureSet(mid, np.array([3.0]))
+    # 41 colunas: os loops mais próximos ficam em 20/41 e 21/41, a 0,012 da crease
+    # (menos que a tolerância absoluta de 1% da diagonal, 0,014)
+    off = evaluate(shapes.grid_plane(41, 41), ref, feats)
+    assert off.crease_coverage_strong == pytest.approx(0.0)
+    assert off.checks["crease_coverage"] is False
+    # 40 colunas: há um loop exatamente em x = 0,5
+    on = evaluate(shapes.grid_plane(40, 40), ref, feats)
+    assert on.crease_coverage_strong == pytest.approx(1.0)
+    assert on.feature_fidelity == pytest.approx(0.0, abs=1e-12)

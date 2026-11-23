@@ -138,13 +138,16 @@ def match_features(
     spacing_rel: float = 0.002,
     corner_angle_deg: float = DEFAULT_CORNER_ANGLE,
     max_samples: int = 400_000,
+    loop_frac: float = 0.3,
 ) -> FeatureMatch:
     """Acha, na malha nova, as arestas que seguem as creases da original.
 
     Uma aresta nova conta como "loop de feature" quando as duas pontas e o meio
-    estão a menos de ``match_tol_rel`` (fração da diagonal) da rede de creases e
-    ela está alinhada (até ``align_deg``) com a crease mais próxima. A partir
-    daí saem:
+    estão perto da rede de creases e ela está alinhada (até ``align_deg``) com
+    a crease mais próxima. "Perto" é o menor entre ``match_tol_rel`` (fração da
+    diagonal) e ``loop_frac`` vezes o comprimento das arestas novas ali: assim,
+    numa malha densa, o loop vizinho, paralelo à crease e a uma aresta de
+    distância, não é confundido com o loop da crease. A partir daí saem:
 
     * ``coverage``: fração do comprimento de crease coberta por um loop desses,
       contando só o loop que tem essa crease como a mais próxima e corre na
@@ -178,10 +181,16 @@ def match_features(
     verts = new_mesh.points
     topo = new_mesh.topology
 
-    # 1. arestas novas que estão em cima da rede de creases
-    dist_v, _, _, _ = ref_grid.query(verts, max_dist=tol)
-    on_v = dist_v <= tol
+    # 1. arestas novas que estão em cima da rede de creases; a tolerância de
+    # cada vértice é limitada pela menor aresta que chega nele
     new_edges = topo.edges[~topo.degenerate_edge]
+    new_len = np.linalg.norm(verts[new_edges[:, 1]] - verts[new_edges[:, 0]], axis=1)
+    local = np.full(num_new, np.inf)
+    np.minimum.at(local, new_edges[:, 0], new_len)
+    np.minimum.at(local, new_edges[:, 1], new_len)
+    vertex_tol = np.minimum(tol, loop_frac * local)
+    dist_v, _, _, _ = ref_grid.query(verts, max_dist=tol)
+    on_v = dist_v <= vertex_tol
     cand = new_edges[on_v[new_edges[:, 0]] & on_v[new_edges[:, 1]]]
     matched = np.zeros((0, 2), dtype=np.int64)
     matched_strong = np.zeros(0, dtype=bool)
@@ -195,7 +204,8 @@ def match_features(
         ref_dir = (seg_b - seg_a)[seg_safe]
         denom = edge_len * seg_len[seg_safe]
         cosine = np.abs(np.einsum("ij,ij->i", edge_dir, ref_dir)) / np.where(denom > 0, denom, 1.0)
-        ok = near & (dist_m <= tol) & (edge_len > 0) & (cosine >= math.cos(math.radians(align_deg)))
+        edge_tol = np.minimum(tol, loop_frac * edge_len)
+        ok = near & (dist_m <= edge_tol) & (edge_len > 0) & (cosine >= math.cos(math.radians(align_deg)))
         matched = cand[ok]
         matched_strong = strong[seg_safe[ok]]
 
