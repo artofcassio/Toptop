@@ -21,7 +21,7 @@ from toptop.core.reproject import (
 )
 
 
-def _cube_reference():
+def _cube_reference() -> tuple[Mesh, FeatureSet]:
     """Cubo unitário triangulado e as 12 arestas dele como feature."""
     return triangle_mesh(shapes.cube(1)), FeatureSet(shapes.cube_feature_edges(shapes.cube(1)))
 
@@ -39,7 +39,7 @@ def _on_side(values: np.ndarray) -> np.ndarray:
     return (values == 0.0) | (values == 1.0)
 
 
-def _plane(xs, ys, z: float = 0.0) -> Mesh:
+def _plane(xs: list[float], ys: np.ndarray, z: float = 0.0) -> Mesh:
     """Grade de quads com linhas nas coordenadas dadas."""
     xs, ys = np.asarray(xs, dtype=float), np.asarray(ys, dtype=float)
     gx, gy = np.meshgrid(xs, ys, indexing="ij")
@@ -53,7 +53,7 @@ def _plane(xs, ys, z: float = 0.0) -> Mesh:
     return Mesh.from_faces(pts, faces, "grade")
 
 
-def _vertex_at(mesh: Mesh, xyz) -> int:
+def _vertex_at(mesh: Mesh, xyz: tuple[float, float, float]) -> int:
     """Índice do vértice numa posição dada."""
     d = np.linalg.norm(mesh.points - np.asarray(xyz, dtype=float), axis=1)
     i = int(np.argmin(d))
@@ -131,28 +131,34 @@ def test_cylinder_pulled_back_to_radius():
 
 
 def test_vertex_near_crease_but_not_on_loop_goes_to_surface():
+    # placa com duas creases retas: x = 0.25 e x = 0.75
     ref = triangle_mesh(shapes.grid_plane(4, 4))
     p = ref.points
-    line = np.flatnonzero(np.abs(p[:, 0] - 0.5) < 1e-12)
     edges = ref.topology.edges
-    feats = FeatureSet(edges[np.isin(edges, line).all(axis=1)])
+    on_line = np.isclose(p[:, 0], 0.25) | np.isclose(p[:, 0], 0.75)
+    same_x = np.isclose(p[edges[:, 0], 0], p[edges[:, 1], 0])
+    feats = FeatureSet(edges[on_line[edges].all(axis=1) & same_x])
+    assert len(feats) == 8
 
-    new = _plane([0.0, 0.2, 0.4, 0.503, 0.7, 1.0], np.linspace(0.0, 1.0, 6), z=0.004)
+    # coluna x = 0.753 corre sobre a crease x = 0.75; nenhuma coluna segue a x = 0.25
+    new = _plane([0.0, 0.2, 0.4, 0.6, 0.753, 1.0], np.linspace(0.0, 1.0, 6), z=0.004)
     pts = new.points.copy()
-    near = _vertex_at(new, (0.4, 0.4, 0.004))
-    pts[near, 0] = 0.49  # a 0.011 da crease, mas sem aresta correndo ao longo dela
+    near = _vertex_at(new, (0.2, 0.4, 0.004))
+    pts[near, 0] = 0.24  # a 0.011 da crease x = 0.25 (dentro da tolerância), fora de loop
     new = new.with_points(pts)
-    loop = np.flatnonzero(np.isclose(pts[:, 0], 0.503) & (pts[:, 1] > 0) & (pts[:, 1] < 1))
+    loop = np.flatnonzero(np.isclose(pts[:, 0], 0.753) & (pts[:, 1] > 0) & (pts[:, 1] < 1))
+    assert len(loop) == 4
 
     res = reproject(new, ref, feats)
     out = res.mesh.points
     assert res.kind[near] == KIND_SURFACE
-    assert out[near] == pytest.approx([0.49, 0.4, 0.0], abs=1e-12)
+    assert out[near] == pytest.approx([0.24, 0.4, 0.0], abs=1e-12)
     assert (res.kind[loop] == KIND_CURVE).all()
-    assert np.allclose(out[loop, 0], 0.5, atol=1e-12) and np.allclose(out[loop, 2], 0.0, atol=1e-12)
-    # pontas da crease na borda e os 4 cantos da placa
-    assert res.corners_snapped == 6 and res.corners_missing == 0
-    assert out[_vertex_at(new, (0.503, 0.0, 0.004))] == pytest.approx([0.5, 0.0, 0.0], abs=1e-12)
+    assert np.allclose(out[loop, 0], 0.75, atol=1e-12) and np.allclose(out[loop, 2], 0.0, atol=1e-12)
+    # 4 cantos da placa + as pontas da crease x = 0.75; as da x = 0.25 ficam sem vértice
+    assert res.corners_snapped == 6 and res.corners_missing == 2
+    assert out[_vertex_at(new, (0.753, 0.0, 0.004))] == pytest.approx([0.75, 0.0, 0.0], abs=1e-12)
+    assert out[_vertex_at(new, (0.0, 0.0, 0.004))] == pytest.approx([0.0, 0.0, 0.0], abs=0.0)
     assert np.abs(out[:, 2]).max() < 1e-12
 
 
@@ -164,24 +170,25 @@ def test_loop_vertex_keeps_to_the_crease_it_follows():
     ref = Mesh.from_faces([(x, y, 0.0) for x, y in pts], tris, "v")
     feats = FeatureSet([(4, 5), (5, 6), (5, 7)])
 
-    # faixa de quads logo acima da crease A; o vértice x = 0.522 está mais
-    # perto da crease B (0.0065) do que da A (0.01), mas o loop corre ao longo de A
-    xs = [0.0, 0.25, 0.5, 0.522, 0.6, 0.8, 1.0]
+    # faixa de quads logo acima da crease A; o vértice x = 0.52 está mais perto
+    # da crease B (0.0052) do que da A (0.01), mas o loop dele corre ao longo de A
+    xs = [0.0] + [0.12 + 0.1 * i for i in range(9)] + [1.0]
     strip_pts = [(x, 0.3, 0.0) for x in xs] + [(x, 0.51, 0.0) for x in xs]
     k = len(xs)
     faces = [(i, i + 1, k + i + 1, k + i) for i in range(k - 1)]
     new = Mesh.from_faces(strip_pts, faces, "faixa")
+    v = _vertex_at(new, (0.52, 0.51, 0.0))
 
     res = reproject(new, ref, feats, include_boundary=False)
     out = res.mesh.points
-    v = k + 3
     assert res.kind[v] == KIND_CURVE
-    assert out[v] == pytest.approx([0.522, 0.5, 0.0], abs=1e-12)
-    assert res.kind[k + 2] == KIND_CORNER and out[k + 2] == pytest.approx([0.5, 0.5, 0.0])
+    assert out[v] == pytest.approx([0.52, 0.5, 0.0], abs=1e-12)
+    top = np.arange(k, 2 * k)
+    assert (res.kind[top] >= KIND_CURVE).all() and np.allclose(out[top, 1], 0.5, atol=1e-12)
     assert res.kind[k] == KIND_CORNER and res.kind[2 * k - 1] == KIND_CORNER
     assert (res.kind[:k] == KIND_SURFACE).all()
-    # a ponta solta da crease B não tem vértice novo por perto
-    assert res.corners_snapped == 3 and res.corners_missing == 1
+    # nenhum vértice novo perto da junção nem da ponta solta da crease B
+    assert res.corners_snapped == 2 and res.corners_missing == 2
     assert any("canto" in m for m in res.messages)
 
 

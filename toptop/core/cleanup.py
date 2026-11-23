@@ -139,8 +139,9 @@ def close_pairs(points: np.ndarray, tol: float) -> np.ndarray:
 
     Cada célula tem lado >= ``tol``; um par próximo está na mesma célula ou numa
     das 26 vizinhas (inclusive na diagonal), então pares que atravessam a divisa
-    entre células também são achados. Pontos idênticos em grande número numa
-    célula geram muitos pares: agrupe-os antes (``weld_vertices`` faz isso).
+    entre células também são achados. Os pontos devem ser finitos. Pontos
+    idênticos em grande número numa célula geram muitos candidatos: agrupe-os
+    antes (``weld_vertices`` faz isso).
     """
     points = np.asarray(points, dtype=np.float64).reshape(-1, 3)
     num = len(points)
@@ -162,29 +163,31 @@ def close_pairs(points: np.ndarray, tol: float) -> np.ndarray:
     cells = sorted_keys[start]
     size = np.diff(np.append(start, num)).astype(np.int64)
 
-    found_i: list[np.ndarray] = []
-    found_j: list[np.ndarray] = []
+    tol2 = float(tol) * float(tol)
+    found: list[np.ndarray] = []
+
+    def keep_close(i: np.ndarray, j: np.ndarray) -> None:
+        """Guarda (em índices originais) só os candidatos que estão mesmo perto."""
+        a, b = order[i], order[j]
+        diff = points[a] - points[b]
+        near = np.einsum("ij,ij->i", diff, diff) <= tol2
+        if near.any():
+            found.append(np.stack([a[near], b[near]], axis=1))
+
     multi = np.flatnonzero(size > 1)
     if multi.size:
-        i, j = _block_pairs(start[multi], size[multi], start[multi], size[multi], same=True)
-        found_i.append(i)
-        found_j.append(j)
+        keep_close(*_block_pairs(start[multi], size[multi], start[multi], size[multi], same=True))
     for dx, dy, dz in _HALF_NEIGHBORS:
         target = cells + (dx * stride[0] + dy * stride[1] + dz)
         pos = np.minimum(np.searchsorted(cells, target), len(cells) - 1)
         hit = np.flatnonzero(cells[pos] == target)
         if hit.size:
             other = pos[hit]
-            i, j = _block_pairs(start[hit], size[hit], start[other], size[other], same=False)
-            found_i.append(i)
-            found_j.append(j)
-    if not found_i:
+            keep_close(*_block_pairs(start[hit], size[hit], start[other], size[other], same=False))
+    if not found:
         return np.zeros((0, 2), dtype=np.int64)
-    a = order[np.concatenate(found_i)]
-    b = order[np.concatenate(found_j)]
-    diff = points[a] - points[b]
-    near = np.einsum("ij,ij->i", diff, diff) <= float(tol) * float(tol)
-    a, b = a[near], b[near]
+    pairs = np.concatenate(found)
+    a, b = pairs[:, 0], pairs[:, 1]
     return np.stack([np.minimum(a, b), np.maximum(a, b)], axis=1).astype(np.int64)
 
 
@@ -405,13 +408,16 @@ def clean_mesh(
     weld_tol_rel: float = DEFAULT_WELD_TOL_REL,
     triangulate: bool = True,
     border_value: float = GUIDE_VALUE,
+    area_tol_rel: float = DEFAULT_AREA_TOL_REL,
 ) -> CleanResult:
     """Limpa uma cópia da malha: solda, tira faces ruins, triangula e aponta non-manifold.
 
     As features (na numeração da malha de entrada) são renumeradas; as que
     somem na solda ou não são arestas da malha limpa caem e são contadas nas
     mensagens. As bordas abertas entram como feature guia com crease
-    ``border_value`` (0 desliga). A malha de entrada não é alterada.
+    ``border_value`` (0 desliga). ``weld_tol_rel`` e ``area_tol_rel`` são as
+    tolerâncias de ``weld_vertices`` e ``remove_degenerate_faces``. A malha de
+    entrada não é alterada.
     """
     messages: list[str] = []
     welded, weld_map = weld_vertices(mesh, weld_tol_rel)
@@ -419,7 +425,7 @@ def clean_mesh(
     unused = mesh.num_points - used_count
     welded_count = used_count - welded.num_points
 
-    tidy, keep, (collapsed, flat, dup) = _remove_degenerate(welded, DEFAULT_AREA_TOL_REL)
+    tidy, keep, (collapsed, flat, dup) = _remove_degenerate(welded, area_tol_rel)
     face_origin = np.flatnonzero(keep).astype(np.int64)
     if triangulate and tidy.num_faces:
         tris, tri_face = triangulate_faces(tidy)
@@ -569,26 +575,38 @@ def reduction_target(mesh: Mesh, limit_triangles: int = DEFAULT_TRIANGLE_LIMIT) 
     return int(limit_triangles)
 
 
-def maya_reduce(name: str, triangle_count: int) -> None:
+def maya_reduce(
+    name: str,
+    triangle_count: int,
+    *,
+    crease_weight: float | None = None,
+    border_weight: float | None = None,
+) -> None:
     """Reduz NO LUGAR a malha ``name`` do Maya até ~``triangle_count`` triângulos.
 
     Usa o algoritmo novo do ``polyReduce`` (``version=1``) parando por número de
     triângulos e preservando creases, hard edges, bordas e a topologia; depois
-    apaga o histórico. Chame só na cópia de trabalho, nunca no original, e
-    dentro do ``undo_chunk`` da operação. Os índices de vértice mudam: releia
-    malha e creases depois.
+    apaga o histórico. ``crease_weight`` e ``border_weight`` (0 a 1; 1 preserva
+    exatamente) só são passados quando dados; senão vale o padrão do Maya (0,5).
+    Chame só na cópia de trabalho, nunca no original, e dentro do
+    ``undo_chunk`` da operação. Os índices de vértice mudam: releia malha e
+    creases depois.
     """
     from maya import cmds
 
-    cmds.polyReduce(
-        name,
-        version=1,
-        termination=2,
-        triangleCount=int(triangle_count),
-        keepCreaseEdge=True,
-        keepHardEdge=True,
-        keepBorder=True,
-        preserveTopology=True,
-        constructionHistory=False,
-    )
+    flags: dict[str, float | int | bool] = {
+        "version": 1,
+        "termination": 2,
+        "triangleCount": int(triangle_count),
+        "keepCreaseEdge": True,
+        "keepHardEdge": True,
+        "keepBorder": True,
+        "preserveTopology": True,
+        "constructionHistory": False,
+    }
+    if crease_weight is not None:
+        flags["keepCreaseEdgeWeight"] = float(crease_weight)
+    if border_weight is not None:
+        flags["keepBorderWeight"] = float(border_weight)
+    cmds.polyReduce(name, **flags)
     cmds.delete(name, constructionHistory=True)

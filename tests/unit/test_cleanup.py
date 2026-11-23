@@ -225,7 +225,7 @@ def test_weld_speed_300k_vertices():
     jitter *= (0.3 * tol / np.linalg.norm(jitter, axis=1))[:, None]
     raw = raw.with_points(raw.points + jitter)
     start = time.perf_counter()
-    welded, vmap = weld_vertices(raw)
+    welded, _ = weld_vertices(raw)
     elapsed = time.perf_counter() - start
     assert welded.num_points == 271 * 271
     assert elapsed < 10.0
@@ -545,3 +545,16 @@ def test_maya_reduce_flags(monkeypatch):
         },
     )
     assert calls[1] == ("delete", ("|copia",), {"constructionHistory": True})
+    calls.clear()
+    maya_reduce("copia", 5000, crease_weight=1.0, border_weight=1)
+    flags = calls[0][2]
+    assert flags["keepCreaseEdgeWeight"] == 1.0 and flags["keepBorderWeight"] == 1.0
+    assert flags["triangleCount"] == 5000
+
+
+def test_clean_mesh_empty():
+    empty = Mesh(np.zeros((2, 3)), np.zeros(0, dtype=np.int64), np.zeros(0, dtype=np.int64))
+    result = clean_mesh(empty, FeatureSet(np.array([[0, 1]]), np.array([3.0])))
+    assert result.mesh.num_points == 0 and result.mesh.num_faces == 0
+    assert len(result.features) == 0 and result.ok
+    assert result.vertex_map.tolist() == [-1, -1]
