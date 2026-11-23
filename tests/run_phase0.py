@@ -59,6 +59,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--samples", type=int, default=50_000, help="amostras por sentido no desvio de forma")
     parser.add_argument("--quadwild-dir", default=None, help="pasta com quadwild(.exe) e quad_from_patches(.exe)")
     parser.add_argument("--quadwild-config", default="flow", help="config principal do QuadWild (flow, flow_noalign, ...)")
+    parser.add_argument("--quadwild-no-remesh", action="store_true",
+                        help="desliga o pré-remesh do QuadWild (use se ele apagar detalhe da peça)")
+    parser.add_argument("--append", action="store_true",
+                        help="mantém as linhas de motor x modelo da execução anterior que não forem refeitas agora")
     parser.add_argument("--in-process", action="store_true", help="roda os motores do Maya neste processo, sem isolar")
     parser.add_argument("--no-images", action="store_true", help="não grava as capturas de wireframe")
     parser.add_argument("--excel-br", action="store_true", help="CSV com ponto e vírgula e vírgula decimal")
@@ -100,8 +104,26 @@ def mayapy_executable() -> str | None:
 def engine_options(engine: str, args: argparse.Namespace) -> dict:
     """Opções de construção de cada motor."""
     if engine == "quadwild":
-        return {"install_dir": args.quadwild_dir, "main_config": args.quadwild_config}
+        return {
+            "install_dir": args.quadwild_dir,
+            "main_config": args.quadwild_config,
+            "do_remesh": not getattr(args, "quadwild_no_remesh", False),
+        }
     return {}
+
+
+def previous_rows(out_dir: str, redo: set[tuple[str, str]]) -> list[dict]:
+    """Linhas da execução anterior (``phase0_results.json``) que não serão refeitas agora."""
+    path = os.path.join(out_dir, "phase0_results.json")
+    if not os.path.isfile(path):
+        return []
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            rows = json.load(handle).get("results", [])
+    except (OSError, ValueError):
+        print(f"AVISO: não consegui ler {path}; --append ignorado.")
+        return []
+    return [row for row in rows if (row.get("model"), row.get("engine")) not in redo]
 
 
 def run_job(spec: phase0.ModelSpec, engine: str, args: argparse.Namespace) -> dict:
@@ -239,6 +261,10 @@ def main(argv: list[str] | None = None) -> int:
         print("AVISO: este Python não é o mayapy; os motores do Maya serão pulados.")
 
     rows: list[dict] = []
+    if args.append:
+        rows = previous_rows(args.out, {(spec.name, engine) for spec in specs for engine in engines})
+        if rows:
+            print(f"--append: mantendo {len(rows)} linha(s) da execução anterior.")
     total = len(specs) * len(engines)
     count = 0
     for spec in specs:
