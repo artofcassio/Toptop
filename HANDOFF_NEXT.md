@@ -45,9 +45,10 @@ e em Python 3.11/NumPy 1.26 (o par do Maya 2025). Sem as variáveis
 - **Quads**: faces de 4 lados / total.
 - **Cobertura das creases**: cada crease original é dividida em trechos de 0,2% da
   diagonal; um trecho conta como coberto quando existe uma aresta nova que (a)
-  está sobre a crease — pontas e meio a menos de `min(1% da diagonal, 0,3 x o
-  comprimento da própria aresta)` —, (b) corre na direção dela e (c) tem essa
-  crease como a mais próxima. Isso impede que, numa chapa fina, o loop de cima
+  está sobre a crease, (b) corre na direção dela e (c) tem essa crease como a
+  mais próxima. "Sobre" quer dizer: cada ponta a menos de `min(1% da diagonal,
+  0,3 x a menor aresta nova que chega nesse vértice)` e o meio da aresta a menos
+  de `min(1% da diagonal, 0,3 x o comprimento da própria aresta)`. Isso impede que, numa chapa fina, o loop de cima
   "cubra" a crease de baixo, e que numa malha densa o loop vizinho, paralelo,
   seja tomado pelo loop da crease.
 - **Fidelidade das quinas**: o maior entre (a) a distância dos vértices desses
@@ -55,9 +56,11 @@ e em Python 3.11/NumPy 1.26 (o par do Maya 2025). Sem as variáveis
   virada > 50°) até o vértice novo mais próximo. Dividido pela diagonal.
   `feature_chord_dev` (a flecha das cordas em creases curvas) sai só como
   informação.
-- **Desvio da forma**: Hausdorff por amostragem nos dois sentidos (vértices,
-  centros de face e 50 mil amostras por área em cada malha), distância exata
-  ponto–triângulo. O sentido original -> nova acusa partes faltando.
+- **Desvio da forma**: Hausdorff por amostragem nos dois sentidos, com distância
+  exata ponto–triângulo. Nova -> original: vértices, centros de face e 50 mil
+  amostras por área da malha nova. Original -> nova: vértices e 50 mil amostras
+  por área da original. Vértices e centros de face entram até 50 mil cada (acima
+  disso, sorteados). O sentido original -> nova acusa partes faltando.
 - **Proporção**: lado maior / menor de cada quad (mediana e percentil 95).
 - **Polos**: vértices internos com valência != 4; os que estão sobre crease forte
   e longe dos cantos são contados à parte (meta: zero).
@@ -69,6 +72,11 @@ e em Python 3.11/NumPy 1.26 (o par do Maya 2025). Sem as variáveis
 
 Os comandos supõem o repositório em `C:\dev\Toptop` e o Maya 2025 no lugar
 padrão. Troque os caminhos se for diferente.
+
+**Use o Prompt de Comando (`cmd.exe`)**, não o PowerShell (o terminal padrão do
+Windows 11): `set` e `%MAYAPY%` são da sintaxe do cmd. Se preferir o PowerShell,
+troque `set MAYAPY="..."` por `$MAYAPY = "..."` e cada `%MAYAPY% ...` por
+`& $MAYAPY ...`. Todas as variáveis criadas com `set` valem só naquela janela.
 
 ### 2.1 Preparar
 
@@ -94,9 +102,14 @@ NumPy 1.26 (Python 3.11, igual ao do Maya 2025) e com NumPy 2.x.
    `third_party\quadwild-bimdf\quadwild.exe`, `quad_from_patches.exe` e a pasta
    `config\` lado a lado. (Uma subpasta a mais também é encontrada.) A pasta
    `third_party/` está no `.gitignore`: o binário GPL nunca entra no repositório.
-3. Alternativa: deixe a pasta onde quiser e aponte a variável
-   `set TOPTOP_QUADWILD_DIR=D:\ferramentas\quadwild-bimdf`, ou passe
-   `--quadwild-dir` ao `run_phase0.py`.
+3. Alternativa: deixe a pasta onde quiser e passe `--quadwild-dir` ao
+   `run_phase0.py`/`run_headless.py`, ou aponte a variável
+   `TOPTOP_QUADWILD_DIR`. Atenção: `set TOPTOP_QUADWILD_DIR=...` vale só na
+   janela do cmd; o Maya aberto pelo menu Iniciar (a janela e a shelf) não a
+   enxerga. Para o Maya, use `setx TOPTOP_QUADWILD_DIR "D:\ferramentas\quadwild-bimdf"`
+   (vale para programas abertos depois) ou uma linha no `Maya.env`. O caminho
+   mais simples continua sendo `third_party\quadwild-bimdf\`, que dispensa a
+   variável.
 
 Conferência rápida, sem modelos do Maya (3 peças sintéticas, ~20 s):
 
@@ -104,7 +117,9 @@ Conferência rápida, sem modelos do Maya (3 peças sintéticas, ~20 s):
 %MAYAPY% tests\run_phase0.py --selftest --engines quadwild
 ```
 
-Deve terminar com `quadwild passou em 3/3 ... QUALIFICA`.
+No resumo do fim deve aparecer `quadwild ... passou em 3/3 ... QUALIFICA` e,
+na linha de baixo, `Motor escolhido pelas métricas: quadwild`. Depois vêm só os
+caminhos dos arquivos gravados.
 
 ### 2.3 Gerar os 10 modelos de teste
 
@@ -177,7 +192,8 @@ Roda cada modelo em cada motor com a mesma densidade e grava em
 - `phase0_results.csv` (use `--excel-br` para abrir direto no Excel em
   português) e `phase0_results.json` (inclui a decisão do portão);
 - `<motor>\<modelo>.obj` (o resultado) e `<motor>\<modelo>.png` (captura);
-- `_entrada\<modelo>.png` (a peça original com as creases).
+- `_entrada\<modelo>.png` (a peça original com as creases). Entradas com mais
+  de 300 mil triângulos (a `09_500k_faces`) não ganham essa captura.
 
 Opções úteis: `--engines quadwild,maya_retopo`, `--models 01,04`,
 `--timeout 600`, `--quadwild-config flow_noalign`, `--quadwild-no-remesh` (o
@@ -187,8 +203,11 @@ forem refeitas; use depois de fazer só o Quad Remesher, por exemplo
 `%MAYAPY% tests\run_phase0.py --engines quadremesher --append`).
 
 O Retopologize roda num `mayapy` separado por execução (o comando não pode ser
-cancelado; assim o tempo limite mata só aquela execução). Motor indisponível é
-pulado com aviso.
+cancelado; assim o tempo limite mata só aquela execução). O processo só é morto
+em `--timeout` + 600 s (20 min no padrão): a folga cobre abrir o Maya, ler o
+modelo e medir. Uma execução que termina depois de `--timeout` é gravada como
+tempo esgotado do mesmo jeito. Para matar antes, reduza `WORKER_MARGIN_S` em
+`tests/run_phase0.py`. Motor indisponível é pulado com aviso.
 
 ### 2.6 Como ler o resultado
 
@@ -206,7 +225,7 @@ Legenda das capturas (duas vistas: frente por cima, costas por baixo):
 As metas estão em `toptop/core/quality.py` (`Targets`) e devem ser recalibradas
 com o que a Fase 0 mostrar.
 
-### 2.7 As três perguntas da seção 3, já respondidas para o QuadWild
+### 2.7 As três perguntas da seção 3 do plano (HANDOFF original), já respondidas para o QuadWild
 
 1. **Aceita lista explícita de arestas de feature?** Sim: arquivo `.sharp`
    (`tipo,face,aresta` por linha), conferido no código-fonte
@@ -239,9 +258,13 @@ Medido nesta sessão (Linux, binário v0.0.2): cilindro de 74 mil triângulos ->
   público. O caminho manual (seção 2.4) não depende deles.
 - Dar a nota visual nos PNGs e recalibrar as metas em `Targets`
   (`toptop/core/quality.py`).
-- Depois de escolher o motor: `%MAYAPY% tests\run_headless.py --save-baseline`
-  e commitar `tests\baseline\headless.json`. Daí em diante, toda mudança roda
-  `%MAYAPY% tests\run_headless.py` (código 1 = alguma métrica piorou > 10%).
+- Depois de escolher o motor:
+  `%MAYAPY% tests\run_headless.py --engine <motor escolhido> --save-baseline`
+  e commitar `tests\baseline\headless.json`, que guarda o motor. Daí em
+  diante, toda mudança roda `%MAYAPY% tests\run_headless.py` (sem `--engine`
+  ele usa o motor da referência; código 1 = alguma métrica piorou > 10%). Com um
+  `--engine` diferente do gravado, ele recusa a comparação (código 2), porque
+  métricas de um motor não servem de referência para outro.
   Atenção: o tempo também entra na comparação; numa máquina ocupada ele pode
   variar mais que 10% (há 1 s de folga).
 
@@ -303,7 +326,14 @@ calcula ao clicar:
 
 ### Pelo script
 
+Os trechos abaixo precisam do repositório no `sys.path`. O botão da shelf o
+coloca lá, mas numa sessão nova do Maya, sem ter clicado no botão, o `import`
+falha. Por isso cada trecho começa com a linha do `sys.path`. Para não precisar
+dela, ponha no `userSetup.py` (`Documentos\maya\2025\scripts\userSetup.py`):
+`import sys; sys.path.append(r"C:\dev\Toptop")`.
+
 ```python
+import sys; sys.path.insert(0, r"C:\dev\Toptop")
 from toptop.core.pipeline import PipelineOptions, maya_retopologize
 novo, resultado = maya_retopologize("pCube1", PipelineOptions(mode="game", detail=5))
 from toptop.core.quality import format_report
@@ -313,6 +343,7 @@ print(format_report(resultado.report)); print("\n".join(resultado.notes))
 ### Exportar uma peça sua para os testes
 
 ```python
+import sys; sys.path.insert(0, r"C:\dev\Toptop")
 from toptop import maya_bridge
 from toptop.core.creases import maya_read_creases
 from toptop.io.obj import write_obj
@@ -323,5 +354,7 @@ write_obj(obj, maya_bridge.mesh_from_maya("minhaPeca"))
 write_features(features_path(obj), maya_read_creases("minhaPeca"))
 ```
 
-Depois acrescente a peça ao `tests\models\models.json` (nome, `obj`,
-`features`, `target_quads`).
+Depois acrescente a peça à lista `"models"` do `tests\models\models.json`. As
+chaves são literais, em inglês: `name` (obrigatória), `obj`, `features` e
+`target_quads` (as outras têm padrão: `<name>.obj`, o `.feat` ao lado e 3000
+quads). Exemplo: `{"name": "minha_peca", "target_quads": 2500}`.

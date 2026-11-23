@@ -57,3 +57,31 @@ def test_selftest_detects_a_regression(rh, tmp_path):
     assert rh.main(["--selftest", "--models", "cubo", "--out", out, "--no-images"]) == 1
     results = json.load(open(os.path.join(out, "headless_results.json"), encoding="utf-8"))
     assert list(results["regressions"]) == ["cubo"]
+
+
+def test_engine_comes_from_the_baseline_and_mismatch_is_refused(rh, tmp_path, capsys, monkeypatch):
+    """Sem --engine, vale o motor da referência; com outro motor, a comparação é recusada."""
+    models = tmp_path / "modelos"
+    models.mkdir()
+    (models / "models.json").write_text(json.dumps({"models": [{"name": "m"}]}), encoding="utf-8")
+    path = str(tmp_path / "headless.json")
+    rh.save_baseline(path, [_entry("m")], {}, "maya_retopo")
+    seen = []
+
+    def fake_run_model(spec, args):
+        seen.append(args.engine)
+        return {**_entry(spec.name), "seconds": 1.0, "message": "", "notes": []}
+
+    monkeypatch.setattr(rh, "run_model", fake_run_model)
+    monkeypatch.setattr(rh.run_phase0, "have_maya", lambda: True)
+    monkeypatch.setattr(rh.run_phase0, "init_maya", lambda: None)
+    common = ["--models-dir", str(models), "--out", str(tmp_path / "o"), "--baseline", path]
+
+    assert rh.main(common) == 0 and seen == ["maya_retopo"]
+    assert rh.main(common + ["--engine", "quadwild"]) == 2 and len(seen) == 1
+    assert "gravada com o motor maya_retopo" in capsys.readouterr().out
+
+    assert rh.main(common + ["--engine", "quadwild", "--save-baseline"]) == 0 and seen[-1] == "quadwild"
+    saved = rh.load_baseline(path)
+    assert saved["engine"] == "quadwild" and set(saved["models"]) == {"m"}
+    assert "será substituída" in capsys.readouterr().out

@@ -2,8 +2,8 @@
 
 Uso (na raiz do repositório):
 
-    mayapy tests\\run_headless.py                    (compara com a referência salva)
-    mayapy tests\\run_headless.py --save-baseline    (grava as métricas atuais como referência)
+    mayapy tests\\run_headless.py                    (compara com a referência salva, no motor dela)
+    mayapy tests\\run_headless.py --engine <motor> --save-baseline    (grava a referência)
     python tests\\run_headless.py --selftest         (3 peças sintéticas, só QuadWild, sem Maya)
 
 Para cada modelo de ``tests/models`` (``models.json`` + ``.obj`` + ``.feat``),
@@ -45,6 +45,7 @@ from toptop.io.obj import read_obj, write_obj  # noqa: E402
 
 DEFAULT_BASELINE = os.path.join(TESTS, "baseline", "headless.json")
 RESULTS_NAME = "headless_results.json"
+DEFAULT_ENGINE = "quadwild"
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
@@ -52,7 +53,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Autoverificação do TopTop: pipeline completo + comparação com a referência.")
     parser.add_argument("--models-dir", default=os.path.join(TESTS, "models"), help="pasta com models.json, .obj e .feat")
     parser.add_argument("--out", default=os.path.join(TESTS, "output", "headless"), help="pasta de saída")
-    parser.add_argument("--engine", default="quadwild", choices=ENGINE_NAMES, help="motor do pipeline")
+    parser.add_argument(
+        "--engine", default=None, choices=ENGINE_NAMES,
+        help=f"motor do pipeline (padrão: o motor gravado na referência; sem referência, {DEFAULT_ENGINE})",
+    )  # fmt: skip
     parser.add_argument("--mode", default="game", choices=("game", "film"), help="modo do pipeline")
     parser.add_argument("--models", default="", help="filtro de modelos: trechos do nome separados por vírgula")
     parser.add_argument("--baseline", default=DEFAULT_BASELINE, help="arquivo de referência das métricas")
@@ -159,6 +163,21 @@ def main(argv: list[str] | None = None) -> int:
         args.models_dir = run_phase0.selftest_models(os.path.join(args.out, "selftest_models"))
         if args.baseline == DEFAULT_BASELINE:
             args.baseline = os.path.join(args.out, "selftest_baseline.json")
+    baseline = load_baseline(args.baseline)
+    saved_engine = baseline.get("engine")
+    if args.engine is None:
+        args.engine = saved_engine if saved_engine in ENGINE_NAMES else DEFAULT_ENGINE
+    if baseline and saved_engine and saved_engine != args.engine:
+        # métricas de um motor não servem de referência para outro
+        if not args.save_baseline:
+            print(
+                f"A referência {args.baseline} foi gravada com o motor {saved_engine}, e esta execução usa "
+                f"{args.engine}. Rode com --engine {saved_engine}, aponte outra referência com --baseline "
+                "ou regrave com --save-baseline."
+            )
+            return 2
+        print(f"Aviso: a referência era do motor {saved_engine}; ela será substituída pela do {args.engine}.")
+        baseline = {}
     specs = phase0.load_models(args.models_dir)
     wanted = [part.strip() for part in args.models.split(",") if part.strip()]
     if wanted:
@@ -183,7 +202,6 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(f"    {entry['status']}: {entry['message'].splitlines()[0] if entry['message'] else ''}")
 
-    baseline = load_baseline(args.baseline)
     regressions, broken = check_against_baseline(entries, baseline, args.tolerance)
     results_path = os.path.join(args.out, RESULTS_NAME)
     with open(results_path, "w", encoding="utf-8") as handle:

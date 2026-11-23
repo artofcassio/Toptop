@@ -44,9 +44,11 @@ import toptop.shelf
 toptop.shelf.install()
 ```
 
-Pelo script, sem a janela:
+Pelo script, sem a janela (a primeira linha é dispensável se o repositório já
+estiver no `sys.path`, pelo botão ou pelo `userSetup.py`):
 
 ```python
+import sys; sys.path.insert(0, r"C:/dev/Toptop")
 from toptop.core.pipeline import PipelineOptions, maya_retopologize
 novo, resultado = maya_retopologize("pCube1", PipelineOptions(mode="game", detail=5))
 print(resultado.report.passed)
