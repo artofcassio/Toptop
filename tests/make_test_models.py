@@ -285,9 +285,10 @@ def model_05_simetrica():
     """Suporte simétrico em X: furos, ressaltos e um rasgo central espelhados."""
     body = box("suporte", (16, 3, 8))
     for side in (-1, 1):
-        boss = cylinder(f"ressalto{side}", 1.6, 2.0, 20, (5 * side, 2.0, -1.8))
-        body = boolean(body, boss, UNION, f"suporte_r{side}")
-    cutters = [cylinder(f"furo{side}", 1.1, 6, 20, (5 * side, 0, 1.8)) for side in (-1, 1)]
+        tag = "esq" if side < 0 else "dir"  # "-" não vale em nome de nó do Maya
+        boss = cylinder(f"ressalto_{tag}", 1.6, 2.0, 20, (5 * side, 2.0, -1.8))
+        body = boolean(body, boss, UNION, f"suporte_r_{tag}")
+    cutters = [cylinder(f"furo_{'esq' if side < 0 else 'dir'}", 1.1, 6, 20, (5 * side, 0, 1.8)) for side in (-1, 1)]
     cutters.append(box("rasgo", (3, 1.6, 10), (0, 1.0, 0)))
     return finish(cut(body, cutters, "simetrica")), {"target_quads": 3000, "symmetry": "x"}
 
@@ -400,7 +401,7 @@ def export_model(node, name, title, options, out_dir):
     from toptop.io.obj import write_obj
 
     cmds = _cmds()
-    node = cmds.rename(node, name)
+    node = cmds.rename(node, "modelo_" + name)  # nome de nó do Maya não pode começar com dígito
     strong, guide = mark_creases(node, options.get("angle", 30.0), options.get("guide_planes", ()))
 
     scene = os.path.abspath(os.path.join(out_dir, name + ".mb"))
@@ -409,7 +410,7 @@ def export_model(node, name, title, options, out_dir):
     cmds.file(save=True, type="mayaBinary", force=True)
 
     features = maya_read_creases(node)
-    copy = cmds.duplicate(node, rr=True, n=name + "_tri")[0]
+    copy = cmds.duplicate(node, rr=True, n="modelo_" + name + "_tri")[0]
     cmds.polyTriangulate(copy, ch=False)
     triangles = maya_bridge.mesh_from_maya(copy)
     cmds.delete(copy)

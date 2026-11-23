@@ -833,6 +833,7 @@ class FakeShelfMaya:
         self.shelves = {"TopTop"} if shelf_exists else set()
         self.buttons: dict[str, dict] = {}
         self.children: dict[str, list[str]] = {}
+        self.others: set[str] = set()  # separadores e outros controles da prateleira
         cmds = types.ModuleType("maya.cmds")
         mel = types.ModuleType("maya.mel")
 
@@ -879,9 +880,12 @@ class FakeShelfMaya:
 
     def _shelfButton(self, *a, **kw):
         if kw.get("exists"):
-            return a[0] in self.buttons
+            return a[0] in self.buttons or a[0] in self.others  # como no Maya: não olha o tipo
         if kw.get("query"):
-            return self.buttons[a[0]].get("docTag")
+            if a[0] not in self.buttons:
+                raise RuntimeError(f"Object '{a[0]}' not found.")
+            key = next(k for k in ("docTag", "label", "command") if kw.get(k))
+            return self.buttons[a[0]].get(key)
         if kw.get("edit"):
             self.buttons[a[0]].update({k: v for k, v in kw.items() if k != "edit"})
             return None
@@ -970,7 +974,7 @@ def test_shelf_install_fallback_and_batch(monkeypatch, capsys):
 
 
 def test_shelf_uses_only_existing_flags():
-    """Cada flag de ``cmds`` usado em shelf.py e window.py existe no Maya 2025 (se a referência existir)."""
+    """Cada flag de ``cmds`` usado no pacote e no gerador de modelos existe no Maya 2025 (se a referência existir)."""
     import ast
     import pickle
 
@@ -979,7 +983,14 @@ def test_shelf_uses_only_existing_flags():
         pytest.skip("referência dos comandos do Maya não disponível (TOPTOP_MAYA_CMDS_PKL)")
     with open(path, "rb") as fh:
         reference = pickle.load(fh)[0]
-    for module in ("toptop/shelf.py", "toptop/ui/window.py"):
+    modules = sorted(
+        os.path.relpath(os.path.join(folder, name), REPO_ROOT).replace(os.sep, "/")
+        for folder, _, names in os.walk(os.path.join(REPO_ROOT, "toptop"))
+        for name in names
+        if name.endswith(".py")
+    ) + ["tests/make_test_models.py"]
+    assert "toptop/maya_bridge.py" in modules
+    for module in modules:
         with open(os.path.join(REPO_ROOT, module), encoding="utf-8") as fh:
             tree = ast.parse(fh.read())
         for node in ast.walk(tree):
@@ -991,7 +1002,7 @@ def test_shelf_uses_only_existing_flags():
             ):
                 command = node.func.attr
                 assert command in reference, f"{module}: cmds.{command} não existe"
-                flags = reference[command]["flags"]
+                flags = set(reference[command]["flags"]) | set(reference[command].get("shortFlags", {}))
                 for kw in node.keywords:
                     if kw.arg is not None:
                         assert kw.arg in flags, f"{module}: cmds.{command}(-{kw.arg}) não existe"
@@ -1026,3 +1037,20 @@ def test_heatmap_button_after_a_run(win, monkeypatch):
     monkeypatch.setattr(pl, "maya_show_heatmap", broken)
     window.heatmap_button.click()
     assert not window.heatmap_button.isChecked() and "objeto apagado" in window.report()
+
+
+def test_shelf_install_skips_separators_and_finds_button_without_doctag(monkeypatch):
+    """Separador na prateleira não derruba o install; botão salvo sem docTag é reaproveitado."""
+    import toptop.shelf as shelf
+
+    fake = FakeShelfMaya(monkeypatch, add_returns=1)  # o retorno do addNewShelfTab não é o nome
+    fake.others.add("separator1")
+    fake.children["TopTop"] = ["separator1"]
+    button = shelf.install(root="C:/repo")
+    assert fake.buttons[button]["parent"] == "TopTop"
+
+    del fake.buttons[button]["docTag"]  # o .mel gravado pelo Maya não guardou a docTag
+    fake.buttons["shelfButton9"] = {"label": "Outro", "command": "print(1)"}
+    fake.children["TopTop"].insert(0, "shelfButton9")
+    assert shelf.install(root="D:/novo") == button
+    assert len(fake.buttons) == 2 and fake.buttons[button]["docTag"] == shelf.BUTTON_TAG

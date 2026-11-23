@@ -867,6 +867,9 @@ class FakeMayaScene:
         cmds.select = select
         cmds.polyReduce = poly_reduce
         cmds.polyCrease = lambda components, **kw: self.calls.append(("polyCrease", list(components), kw))
+        # o que a estimativa pede ao Maya: área e caixa envolvente em espaço de mundo
+        cmds.polyEvaluate = lambda shape, worldArea: float(pl.surface_area(original))
+        cmds.exactWorldBoundingBox = lambda shape: [*original.points.min(axis=0), *original.points.max(axis=0)]
         maya = types.ModuleType("maya")
         maya.cmds = cmds
 

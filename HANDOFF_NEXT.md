@@ -71,7 +71,10 @@ e em Python 3.11/NumPy 1.26 (o par do Maya 2025). Sem as variáveis
 ## 2. Fase 0 no Windows, passo a passo
 
 Os comandos supõem o repositório em `C:\dev\Toptop` e o Maya 2025 no lugar
-padrão. Troque os caminhos se for diferente.
+padrão. Troque os caminhos se for diferente; no **Maya 2026**, troque `Maya2025`
+por `Maya2026` (o Python é o mesmo 3.11). Não existe cache de flags do Maya 2026
+no pymel: as chamadas foram conferidas contra 2022–2025, e o adaptador do
+Retopologize filtra os flags pelo `help polyRetopo` da versão em uso.
 
 **Use o Prompt de Comando (`cmd.exe`)**, não o PowerShell (o terminal padrão do
 Windows 11): `set` e `%MAYAPY%` são da sintaxe do cmd. Se preferir o PowerShell,
@@ -329,7 +332,7 @@ calcula ao clicar:
 Os trechos abaixo precisam do repositório no `sys.path`. O botão da shelf o
 coloca lá, mas numa sessão nova do Maya, sem ter clicado no botão, o `import`
 falha. Por isso cada trecho começa com a linha do `sys.path`. Para não precisar
-dela, ponha no `userSetup.py` (`Documentos\maya\2025\scripts\userSetup.py`):
+dela, ponha no `userSetup.py` (`Documentos\maya\<versão>\scripts\userSetup.py`, por exemplo `maya\2026\scripts`):
 `import sys; sys.path.append(r"C:\dev\Toptop")`.
 
 ```python

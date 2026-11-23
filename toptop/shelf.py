@@ -16,7 +16,7 @@ próximas sessões; o próprio botão põe o repositório no ``sys.path``.
 
 Para ter ``import toptop`` disponível desde a abertura do Maya (para usar no
 Script Editor sem o botão), ponha no ``userSetup.py`` (em
-``Documentos/maya/2025/scripts/userSetup.py``)::
+``Documentos/maya/<versão>/scripts/userSetup.py``, por exemplo ``maya/2026/scripts``)::
 
     import sys
     TOPTOP = r"C:/caminho/para/Toptop"
@@ -71,13 +71,24 @@ def button_flags(command: str) -> dict[str, str]:
 
 
 def _find_button(shelf: str) -> str | None:
-    """Botão do TopTop já existente na prateleira (pela ``docTag``)."""
+    """Botão do TopTop já existente na prateleira.
+
+    Pela ``docTag`` ou, como o arquivo que o Maya grava da prateleira pode não
+    guardá-la, pelo rótulo + comando que abre a janela. O ``exists`` do
+    ``shelfButton`` não olha o tipo (um separador passa), então qualquer
+    controle que não responda como botão é pulado.
+    """
     from maya import cmds
 
     for child in cmds.shelfLayout(shelf, query=True, childArray=True) or []:
-        if not cmds.shelfButton(child, exists=True):
+        try:
+            if cmds.shelfButton(child, query=True, docTag=True) == BUTTON_TAG:
+                return child
+            label = cmds.shelfButton(child, query=True, label=True)
+            command = cmds.shelfButton(child, query=True, command=True) or ""
+        except RuntimeError:  # separador ou outro controle que não é botão
             continue
-        if cmds.shelfButton(child, query=True, docTag=True) == BUTTON_TAG:
+        if label == BUTTON_LABEL and "toptop.ui.window" in command:
             return child
     return None
 
@@ -101,8 +112,10 @@ def install(shelf_name: str = DEFAULT_SHELF, root: str | None = None) -> str:
     if cmds.shelfLayout(shelf_name, exists=True):
         shelf = shelf_name
     else:
-        # addNewShelfTab registra a aba nas preferências (ela volta na próxima sessão)
-        shelf = mel.eval(f'addNewShelfTab "{shelf_name}"') or shelf_name
+        # addNewShelfTab registra a aba nas preferências (ela volta na próxima sessão);
+        # o retorno dele não é o nome da aba, então a aba é procurada pelo nome pedido
+        mel.eval(f'addNewShelfTab "{shelf_name}"')
+        shelf = shelf_name
         if not cmds.shelfLayout(shelf, exists=True):
             shelf = cmds.shelfLayout(shelf_name, parent=top)
 
@@ -112,7 +125,7 @@ def install(shelf_name: str = DEFAULT_SHELF, root: str | None = None) -> str:
         button = cmds.shelfButton(parent=shelf, docTag=BUTTON_TAG, **flags)
         action = "criado"
     else:
-        cmds.shelfButton(button, edit=True, **flags)
+        cmds.shelfButton(button, edit=True, docTag=BUTTON_TAG, **flags)
         action = "atualizado"
     cmds.shelfTabLayout(top, edit=True, selectTab=shelf.split("|")[-1])
     cmds.saveAllShelves(top)

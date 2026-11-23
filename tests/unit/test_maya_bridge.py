@@ -156,3 +156,21 @@ def test_pipeline_output_has_no_loose_vertices():
     used[result.mesh.connects] = True
     assert used.all()
     assert len(result.vertex_deviation) == result.mesh.num_points
+
+
+def test_estimate_inputs_ask_maya_instead_of_reading_the_mesh(bridge, monkeypatch):
+    """A estimativa (a cada troca de seleção) usa polyEvaluate + caixa; só lê a malha se o Maya não responder."""
+    module, _ = bridge
+    from toptop.core import pipeline
+
+    cmds = sys.modules["maya.cmds"]
+    cmds.polyEvaluate = lambda shape, worldArea: 24.0
+    cmds.exactWorldBoundingBox = lambda shape: [0.0, 0.0, 0.0, 2.0, 2.0, 1.0]
+    monkeypatch.setattr(module, "mesh_from_maya", lambda *a, **kw: pytest.fail("leu a malha inteira"))
+    assert pipeline.maya_estimate_inputs("obj") == (24.0, 3.0)
+
+    cmds.polyEvaluate = lambda shape, worldArea: "Nothing counted : no polygonal object is selected."
+    cube = shapes.cube(1, size=2.0)
+    monkeypatch.setattr(module, "mesh_from_maya", lambda *a, **kw: cube)
+    area, diagonal = pipeline.maya_estimate_inputs("obj")
+    assert area == pytest.approx(24.0) and diagonal == pytest.approx(cube.diagonal())

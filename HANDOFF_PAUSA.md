@@ -11,7 +11,14 @@ As instruções completas da Fase 0 no Windows continuam em [`HANDOFF_NEXT.md`](
 
 ## 1. O que falta fazer agora
 
-### 1.1 Corrigir a documentação (achados da última verificação, ainda não aplicados)
+> **Atualização (sessão seguinte):** 1.1 e 1.2 feitas. Os 10 achados foram aplicados
+> (o nº 1 também no código: `run_headless.py` usa o motor da referência e recusa
+> comparar com outro). A camada Maya passou por uma auditoria voltada ao Maya 2026;
+> o resultado e o que ainda precisa ser conferido no Maya estão na seção 1.5. Testes:
+> 264 passam, com o QuadWild real e as flags do Maya 2025; as chamadas `cmds` do
+> pacote inteiro e do `make_test_models.py` agora também são conferidas (2022 a 2025).
+
+### 1.1 Corrigir a documentação (achados da última verificação, aplicados)
 
 Um revisor independente conferiu o `HANDOFF_NEXT.md` contra o código, rodando os
 comandos. A verificação foi interrompida na pausa e estes 10 achados ficaram sem aplicar:
@@ -62,6 +69,43 @@ Passo a passo em `HANDOFF_NEXT.md` seção 2:
   `.exe` do Windows não foi testado. No Linux, o binário dá segfault ao sair; isso já é
   tratado (`KILLED_AFTER_DONE`).
 - Os controles da Fase 2/3 na janela (simetria, modo film completo e outros) estão desativados.
+
+### 1.5 Auditoria da camada Maya (Maya 2026)
+
+Corrigido, com testes (API do Maya simulada):
+
+- `maya_bridge.create_mesh` confere se o Maya criou o mesmo número de vértices e
+  faces. Se a numeração mudasse, hard edges, creases e mapa de calor cairiam nos
+  vértices errados sem aviso. O pipeline agora compacta as cascas antes de juntar.
+- `maya_read_creases`: `getCreaseEdges` que falha numa malha sem creases vira
+  "sem creases"; só as arestas com crease são lidas (antes, uma chamada da API por
+  aresta da malha toda).
+- Retopologize: se o `replaceOriginal` não for aplicado, o resultado é lido do
+  objeto novo criado pelo `polyRetopo`; nada do motor fica na cena; malha intacta
+  vira erro claro, em vez de "resultado" igual à entrada.
+- Shelf: um separador na prateleira derrubava o `install()` (o `exists` do
+  `shelfButton` não olha o tipo); o botão salvo sem `docTag` agora é achado pelo
+  rótulo + comando (sem isso, reinstalar duplicava); o retorno do `addNewShelfTab`
+  não é mais usado como nome da aba.
+- Janela: a estimativa de quads (a cada troca de seleção) usa `polyEvaluate` +
+  `exactWorldBoundingBox` em vez de copiar a malha para o Python, o que travava
+  o Maya ao clicar numa peça pesada.
+- `make_test_models.py`: nomes de nó sem dígito no começo e sem `-`.
+- Caminhos do Maya 2026 na documentação (`Maya2026`, `maya\2026\scripts`).
+
+Ainda a conferir no Maya 2026 (não dá para verificar fora dele; a documentação da
+Autodesk não estava acessível desta sessão):
+
+- `polyRetopo` existe no `mayapy` sem carregar plugin? Se o selftest disser "esta
+  versão do Maya não tem o comando polyRetopo", é um plugin não carregado.
+- `polyRetopo` com `replaceOriginal` + `constructionHistory=False` substitui a
+  malha? O adaptador agora cobre os dois casos, mas vale olhar o primeiro resultado.
+- O `polyReduce` mantém os valores de crease? Se não, o pipeline transfere as
+  creases do original pela geometria (nota "transferidas do original" no relatório).
+- Ler 500 mil faces (`mesh_from_maya`, `edge_vertex_pairs`, Sugerir/Verificar)
+  converte a API ponto a ponto em Python: alguns segundos por leitura.
+- Desfazer/refazer do objeto criado e as cores do mapa de calor (já listados na
+  seção 3 do HANDOFF_NEXT).
 
 ---
 
