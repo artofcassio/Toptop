@@ -2,7 +2,10 @@
 
 A janela segue a seleção (o "objeto alvo" é a primeira malha selecionada) e
 só calcula quando um botão é clicado; a única conta automática é a estimativa
-de quads ao lado do nível de detalhe, que é barata e fica em cache.
+de quads ao lado do nível de detalhe: a malha é lida uma vez por objeto (só a
+área e a diagonal ficam em cache) e qualquer nível ou modo sai dessa leitura.
+Os botões releem a seleção antes de agir, então renomear ou mudar o objeto de
+pai não deixa a janela com um caminho velho.
 
 Uso, dentro do Maya::
 
@@ -24,11 +27,14 @@ import numpy as np
 from PySide6 import QtCore, QtGui, QtWidgets
 
 from ..core import creases, pipeline, quality
+from ..core.cleanup import DEFAULT_TRIANGLE_LIMIT
 from ..core.creases import GUIDE_VALUE, STRONG_VALUE, InputCheck
 from ..core.pipeline import (
     DETAIL_DEFAULT,
     DETAIL_MAX,
     DETAIL_MIN,
+    SHELL_DIRECT,
+    SHELL_FAILED,
     PipelineError,
     PipelineOptions,
     PipelineResult,
@@ -45,6 +51,17 @@ PHASE3_TIP = "Fase 3"
 ESTIMATE_DELAY_MS = 150
 #: o progresso vai de 0 a este valor na barra
 PROGRESS_STEPS = 1000
+#: faixa e passo do limite de redução (triângulos)
+REDUCE_LIMIT_RANGE = (1_000, 10_000_000)
+REDUCE_LIMIT_STEP = 10_000
+#: motores que a janela lista, mas nunca deixa escolher, com o motivo
+MANUAL_ONLY_ENGINES = {
+    "quadremesher": (
+        "a licença do Quad Remesher não cobre uso automatizado (a retopologia o chamaria sozinha, "
+        "uma vez por casca); use o fluxo manual: toptop.engine.quadremesher.prepare_manual e "
+        "collect_manual (veja HANDOFF_NEXT.md)"
+    ),
+}
 
 #: instância aberta (a janela é única)
 _window: TopTopWindow | None = None
@@ -71,7 +88,10 @@ def guide_crease_value(threshold: float) -> float:
 
 
 def engine_choices() -> list[tuple[str, str, bool, str]]:
-    """(nome, rótulo, disponível?, explicação) de cada motor de ``ENGINE_NAMES``."""
+    """(nome, rótulo, disponível?, explicação) de cada motor de ``ENGINE_NAMES``.
+
+    Os motores de ``MANUAL_ONLY_ENGINES`` aparecem sempre indisponíveis, com o motivo.
+    """
     out = []
     for name in ENGINE_NAMES:
         try:
@@ -80,6 +100,8 @@ def engine_choices() -> list[tuple[str, str, bool, str]]:
             ok, why = engine.availability()
         except Exception as exc:  # um adaptador quebrado não pode derrubar a janela
             label, ok, why = name, False, f"erro ao carregar o motor: {exc}"
+        if name in MANUAL_ONLY_ENGINES:
+            ok, why = False, MANUAL_ONLY_ENGINES[name]
         out.append((name, label, bool(ok), str(why)))
     return out
 
@@ -124,13 +146,19 @@ def format_check(target: str, check: InputCheck, threshold: float, selected: int
 
 
 def format_result(new: str, result: PipelineResult, options: PipelineOptions) -> str:
-    """Relatório final: ``quality.format_report`` mais objeto criado, tempos e notas."""
+    """Relatório final: ``quality.format_report`` mais objeto criado, cascas, creases, tempos e notas."""
     lines = [quality.format_report(result.report)]
     if len(result.shell_reports) > 1:
         lines.append("")
         lines.append("Cascas:")
-        for k, rep in enumerate(result.shell_reports, 1):
-            state = "APROVADA" if rep.passed else "REPROVADA"
+        status = list(result.shell_status) + [""] * (len(result.shell_reports) - len(result.shell_status))
+        for k, (rep, how) in enumerate(zip(result.shell_reports, status), 1):
+            if how == SHELL_DIRECT:
+                state = "convertida direto (pequena demais para o motor)"
+            elif how == SHELL_FAILED:
+                state = "o motor falhou: convertida direto"
+            else:
+                state = "APROVADA" if rep.passed else "REPROVADA"
             lines.append(f"  {k}: {format_int(rep.quads)} quads, {state}")
     lines.append("")
     lines.append(f"Objeto criado: {new.split('|')[-1]}")
@@ -138,6 +166,12 @@ def format_result(new: str, result: PipelineResult, options: PipelineOptions) ->
         lines.append(f"Hard edges: {format_int(len(result.hard_edges))} aresta(s) sobre creases fortes")
     else:
         lines.append("Hard edges: nenhuma (tudo suave)")
+    if options.mode == "film":
+        strong = int(result.crease_edges.strong_mask(float(options.strong_threshold)).sum())
+        lines.append(
+            f"Creases: {format_int(len(result.crease_edges))} aresta(s) de loop de feature"
+            f" ({format_int(strong)} forte(s), {format_int(len(result.crease_edges) - strong)} guia(s))"
+        )
     lines.append(
         f"Tempo: {result.seconds:.1f} s no total, {result.engine_seconds:.1f} s no motor"
         f" (pedido: {format_int(result.target_quads)} quads)"
@@ -228,7 +262,8 @@ class TopTopWindow(QtWidgets.QWidget):
         self._cancel_requested = False
         self._target_dirty = False
         self._closing = False
-        self._estimate_cache: dict[tuple[str, int, str], int] = {}
+        #: (área, diagonal) de cada objeto já lido; qualquer nível e modo sai daqui
+        self._estimate_inputs: dict[str, tuple[float, float]] = {}
         self._engines: list[tuple[str, str, bool, str]] = []
         self._callbacks: list = []
         self.last_result: PipelineResult | None = None
@@ -300,6 +335,19 @@ class TopTopWindow(QtWidgets.QWidget):
         detail_row.addWidget(self.detail_value)
         detail_row.addWidget(self.estimate_label)
         form.addRow("Nível de detalhe:", detail_row)
+
+        self.reduce_spin = QtWidgets.QSpinBox()
+        self.reduce_spin.setObjectName("toptopReduceLimit")
+        self.reduce_spin.setRange(*REDUCE_LIMIT_RANGE)
+        self.reduce_spin.setSingleStep(REDUCE_LIMIT_STEP)
+        self.reduce_spin.setValue(DEFAULT_TRIANGLE_LIMIT)
+        self.reduce_spin.setGroupSeparatorShown(True)
+        self.reduce_spin.setSuffix(" triângulos")
+        self.reduce_spin.setToolTip(
+            "Acima deste número de triângulos, o Maya reduz uma cópia antes do motor (o original não muda). "
+            "Aumente para o Maya reduzir menos."
+        )
+        form.addRow("Limite de redução:", self.reduce_spin)
         root.addWidget(density)
 
         # Creases
@@ -491,6 +539,7 @@ class TopTopWindow(QtWidgets.QWidget):
             strong_threshold=float(self.threshold_spin.value()),
             hard_edges=bool(self.hard_edges_check.isChecked()),
             suggest_angle=float(self.angle_spin.value()),
+            reduce_limit=int(self.reduce_spin.value()),
             engine=name or "quadwild",
         )
 
@@ -560,7 +609,7 @@ class TopTopWindow(QtWidgets.QWidget):
             self.target_label.setText(target.split("|")[-1])
             self.target_label.setToolTip(target)
         if changed:
-            self._estimate_cache.clear()
+            self._estimate_inputs.clear()
             self.schedule_estimate()
         self._update_buttons()
 
@@ -569,7 +618,7 @@ class TopTopWindow(QtWidgets.QWidget):
         self._estimate_timer.start()
 
     def update_estimate(self) -> None:
-        """Mostra a estimativa de quads (``pipeline.maya_estimate``, em cache por alvo/nível/modo)."""
+        """Mostra a estimativa de quads: lê área e diagonal uma vez por alvo (``pipeline.maya_estimate_inputs``)."""
         self._estimate_timer.stop()
         if self._running:
             return
@@ -577,15 +626,16 @@ class TopTopWindow(QtWidgets.QWidget):
         if target is None:
             self.estimate_label.setText("")
             return
-        key = (target, int(self.detail_slider.value()), self.mode())
-        if key not in self._estimate_cache:
-            try:
-                self._estimate_cache[key] = int(pipeline.maya_estimate(target, key[1], key[2]))
-            except Exception as exc:
-                self.estimate_label.setText("≈ ? quads")
-                self.estimate_label.setToolTip(f"Não deu para estimar: {exc}")
-                return
-        self.estimate_label.setText(f"≈ {format_int(self._estimate_cache[key])} quads")
+        try:
+            if target not in self._estimate_inputs:
+                self._estimate_inputs[target] = pipeline.maya_estimate_inputs(target)
+            area, diagonal = self._estimate_inputs[target]
+            quads = int(pipeline.estimate_from(area, diagonal, int(self.detail_slider.value()), self.mode()))
+        except Exception as exc:
+            self.estimate_label.setText("≈ ? quads")
+            self.estimate_label.setToolTip(f"Não deu para estimar: {exc}")
+            return
+        self.estimate_label.setText(f"≈ {format_int(quads)} quads")
         self.estimate_label.setToolTip("Estimativa de quads para o objeto alvo neste nível e modo.")
 
     def _detail_changed(self, value: int) -> None:
@@ -606,6 +656,7 @@ class TopTopWindow(QtWidgets.QWidget):
 
     def suggest(self) -> None:
         """"Sugerir creases": seleciona as quinas acima do ângulo; não grava nada."""
+        self.refresh_target()  # renomear ou mudar de pai não dispara SelectionChanged
         target = self._target
         if target is None:
             self._set_report("Selecione uma malha para sugerir creases.")
@@ -653,6 +704,7 @@ class TopTopWindow(QtWidgets.QWidget):
 
     def check_input(self) -> None:
         """"Verificar entrada": mostra os avisos e seleciona as arestas com problema."""
+        self.refresh_target()  # renomear ou mudar de pai não dispara SelectionChanged
         target = self._target
         if target is None:
             self._set_report("Selecione uma malha para verificar.")
@@ -708,8 +760,11 @@ class TopTopWindow(QtWidgets.QWidget):
 
     def retopologize(self) -> None:
         """"Retopologizar": roda ``pipeline.maya_retopologize`` no alvo e mostra o relatório."""
+        if self._running:
+            return
+        self.refresh_target()  # renomear ou mudar de pai não dispara SelectionChanged
         target = self._target
-        if target is None or self._running:
+        if target is None:
             return
         name, ok, why = self.selected_engine()
         if not ok:

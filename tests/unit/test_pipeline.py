@@ -45,6 +45,7 @@ from toptop.engine.base import (
     EngineCancelled,
     EngineError,
     EngineTimeout,
+    EngineUnavailable,
     RunInfo,
     as_feature_pairs,
 )
@@ -546,12 +547,265 @@ def test_transfer_features_between_densities():
 
 
 # --------------------------------------------------------------------------
+# Cascas pequenas, planas, com falha e muito próximas
+# --------------------------------------------------------------------------
+
+
+def _loose_triangle() -> Mesh:
+    """Um triângulo solto (sobra de booleana) longe do cubo unitário."""
+    return Mesh.from_faces([(3.0, 0.0, 0.0), (3.1, 0.0, 0.0), (3.0, 0.1, 0.0)], [(0, 1, 2)])
+
+
+def test_split_into_quads_keeps_shape_edges_and_orientation():
+    tri = _loose_triangle()
+    quads = pl.split_into_quads(tri)
+    assert quads.num_faces == 3 and bool((quads.counts == 4).all()) and quads.num_points == 7
+    assert surface_area(quads) == pytest.approx(surface_area(tri))
+    normals = np.cross(quads.points[quads.connects.reshape(-1, 4)[:, 1]] - quads.points[quads.connects.reshape(-1, 4)[:, 0]],
+                       quads.points[quads.connects.reshape(-1, 4)[:, 3]] - quads.points[quads.connects.reshape(-1, 4)[:, 0]])
+    assert (normals[:, 2] > 0).all()  # mesmo sentido do triângulo (+Z)
+
+    box = triangle_mesh(shapes.cube(1))
+    split = pl.split_into_quads(box)
+    assert split.num_faces == 36 and bool((split.counts == 4).all())
+    topo = split.topology
+    assert not topo.boundary_edge.any() and not topo.nonmanifold_edge.any()
+    assert _signed_volume(split) == pytest.approx(1.0)
+    # cada aresta do cubo vira duas arestas em linha: as creases continuam loops
+    on_edges = shapes.cube_feature_edges(split)
+    assert _length(split, on_edges) == pytest.approx(12.0)
+    assert pl.split_into_quads(Mesh(np.zeros((0, 3)), [], [])).num_faces == 0
+
+
+def test_is_flat():
+    plane = triangle_mesh(shapes.grid_plane(3, 3))
+    assert pl.is_flat(plane)
+    tilted = plane.with_points(plane.points @ np.array([[1.0, 0, 0], [0, 0.6, 0.8], [0, -0.8, 0.6]]) + 5.0)
+    assert pl.is_flat(tilted)
+    bumped = plane.points.copy()
+    bumped[5, 2] = 1e-2
+    assert not pl.is_flat(plane.with_points(bumped))
+    assert not pl.is_flat(triangle_mesh(shapes.cube(1)))
+    assert pl.is_flat(_loose_triangle())
+
+
+def test_tiny_stray_shell_skips_the_engine():
+    """Um triângulo solto não vai para o motor (o QuadWild trava nele): vira 3 quads e o resto segue."""
+    mesh, feats = _cube_input()
+    combined = shapes.combine(mesh, _loose_triangle())
+    engine = FakeEngine()
+    result = run_pipeline(combined, feats, PipelineOptions(engine=engine, target_quads=600))
+    assert len(engine.calls) == 1 and engine.calls[0]["faces"] == 12
+    assert result.shell_status == [pl.SHELL_ENGINE, pl.SHELL_DIRECT]
+    assert result.shell_targets[1] == 0 and result.shell_targets[0] > 0
+    assert any("menos de 8 triângulos" in n and "casca(s) 2" in n for n in result.notes)
+    out = result.mesh
+    assert bool((out.counts == 4).all()) and shells(out)[1] == 2
+    assert out.num_faces == 600 + 3
+    report = result.report
+    assert report.hausdorff < 1e-9 and report.passed, (report.checks, report.notes)
+    assert result.shell_reports[1].engine == "direto"
+
+
+def test_only_tiny_shells_never_call_the_engine():
+    engine = FakeEngine(fail=EngineError("não devia rodar"))
+    result = run_pipeline(_loose_triangle(), FeatureSet.empty(), PipelineOptions(engine=engine, target_quads=24))
+    assert not engine.calls and result.shell_status == [pl.SHELL_DIRECT]
+    assert result.mesh.num_faces == 3 and result.engine_seconds == 0.0
+
+
+class FailingShellEngine(FakeEngine):
+    """Motor falso que falha nas cascas com o número de faces dado."""
+
+    def __init__(self, fail_faces: int, error: Exception) -> None:
+        super().__init__()
+        self.fail_faces = fail_faces
+        self.error = error
+
+    def remesh(self, mesh, feature_edges, density, *, cancel=None, progress=None) -> Mesh:
+        """Falha só na casca escolhida."""
+        if mesh.num_faces == self.fail_faces:
+            self.calls.append({"faces": mesh.num_faces, "failed": True})
+            raise self.error
+        return super().remesh(mesh, feature_edges, density, cancel=cancel, progress=progress)
+
+
+def _two_cubes() -> tuple[Mesh, FeatureSet]:
+    """Cubo 2x2x2 (48 triângulos) e cubo unitário (12 triângulos) separados, com as creases."""
+    big = triangle_mesh(shapes.cube(2, 2.0))
+    small, small_feats = _cube_input(1.0, (3.0, 0.0, 0.0))
+    mesh = shapes.combine(big, small)
+    feats = FeatureSet(shapes.cube_feature_edges(big, 2.0)).merged(FeatureSet(small_feats.edges + big.num_points))
+    return mesh, feats
+
+
+def test_engine_failure_on_one_shell_keeps_the_others():
+    mesh, feats = _two_cubes()
+    engine = FailingShellEngine(12, EngineTimeout("tempo limite de 60 s excedido", "/tmp/pasta", "log"))
+    result = run_pipeline(mesh, feats, PipelineOptions(engine=engine, target_quads=1500))
+    assert [c["faces"] for c in engine.calls] == [48, 12]
+    assert result.shell_status == [pl.SHELL_ENGINE, pl.SHELL_FAILED]
+    note = next(n for n in result.notes if "Casca 2 de 2" in n)
+    assert "tempo limite" in note and "/tmp/pasta" in note and "convertida direto" in note
+    out = result.mesh
+    assert shells(out)[1] == 2 and bool((out.counts == 4).all())
+    assert result.report.hausdorff < 1e-9
+    assert result.report.passed is False
+    assert any("o motor falhou na(s) casca(s) 2" in n for n in result.report.notes)
+
+
+def test_engine_failure_everywhere_or_unavailable_still_raises():
+    mesh, feats = _two_cubes()
+    # a casca grande falhou e a pequena nem foi para o motor: nada passou pelo motor
+    combined = shapes.combine(triangle_mesh(shapes.cube(2, 2.0)), _loose_triangle())
+    engine = FailingShellEngine(48, EngineError("quebrou"))
+    with pytest.raises(EngineError, match="Casca 1 de 2"):
+        run_pipeline(combined, None, PipelineOptions(engine=engine, target_quads=600))
+
+    # motor indisponível e cancelamento param tudo na hora (a segunda casca nem roda)
+    for error in (EngineUnavailable("não instalado"), EngineCancelled("cancelado")):
+        engine = FailingShellEngine(48, error)
+        with pytest.raises(type(error)):
+            run_pipeline(mesh, feats, PipelineOptions(engine=engine, target_quads=600))
+        assert len(engine.calls) == 1
+
+
+class FakeQuadWild(qw.QuadWildEngine):
+    """QuadWild de mentira: anota se o remesh estava ligado e devolve a grade do motor falso."""
+
+    def __init__(self, **kw) -> None:
+        super().__init__(**kw)
+        self.grid = FakeEngine()
+        self.remesh_flags: list[tuple[int, bool]] = []
+
+    def availability(self) -> tuple[bool, str]:
+        """Sempre disponível."""
+        return True, "falso"
+
+    def remesh(self, mesh, feature_edges, density, *, cancel=None, progress=None) -> Mesh:
+        """Registra ``do_remesh`` e delega para o motor falso."""
+        self.remesh_flags.append((mesh.num_faces, self.do_remesh))
+        return self.grid.remesh(mesh, feature_edges, density, cancel=cancel, progress=progress)
+
+
+def test_flat_shell_runs_quadwild_without_remesh():
+    """O remesh do QuadWild trava em casca plana: ela roda numa cópia do motor sem o remesh."""
+    cube, cube_feats = _cube_input()
+    plane = shapes.translated(triangle_mesh(shapes.grid_plane(3, 3)), (3.0, 0.0, 0.0))
+    mesh = shapes.combine(cube, plane)
+    engine = FakeQuadWild()
+    result = run_pipeline(mesh, cube_feats, PipelineOptions(engine=engine, target_quads=800))
+    # a lista de chamadas é a mesma na cópia rasa: o cubo com remesh, o plano sem
+    assert sorted(engine.remesh_flags) == [(12, True), (18, False)]
+    assert engine.do_remesh is True  # o motor do usuário não foi mexido
+    assert result.shell_status == [pl.SHELL_ENGINE, pl.SHELL_ENGINE]
+    assert any("plana" in n and "sem o remesh" in n for n in result.notes)
+    assert bool((result.mesh.counts == 4).all()) and result.report.hausdorff < 1e-9
+    clone = pl._flat_shell_engine(engine)
+    assert clone is not engine and clone.do_remesh is False and engine.do_remesh is True
+    # motor que não é o QuadWild serve como está
+    fake = FakeEngine()
+    assert pl._flat_shell_engine(fake) is fake
+
+
+def test_close_shells_are_reprojected_onto_their_own_reference():
+    """Folga menor que o desvio do motor: cada casca volta para o próprio cubo, sem grudar no vizinho."""
+    gap = 0.004
+    a, a_feats = _cube_input()
+    b, b_feats = _cube_input(1.0, (1.0 + gap, 0.0, 0.0))
+    mesh = shapes.combine(a, b)
+    feats = a_feats.merged(FeatureSet(b_feats.edges + a.num_points))
+    result = run_pipeline(mesh, feats, PipelineOptions(engine=FakeEngine(jitter=0.0), target_quads=1200))
+    out = result.mesh
+    labels, count = shells(out)
+    assert count == 2
+    spans = []
+    for k in range(count):
+        ids = np.unique(out.connects[np.repeat(labels == k, out.counts)])
+        spans.append((float(out.points[ids, 0].min()), float(out.points[ids, 0].max())))
+    spans.sort()
+    assert spans[0] == pytest.approx((0.0, 1.0), abs=1e-9)
+    assert spans[1] == pytest.approx((1.0 + gap, 2.0 + gap), abs=1e-9)
+    assert result.report.passed, result.report.checks
+    for shell_report in result.shell_reports:
+        assert shell_report.hausdorff < 1e-9 and shell_report.feature_fidelity < 1e-9
+        assert shell_report.passed, shell_report.checks
+
+
+def test_a_bad_shell_fails_the_whole_report(monkeypatch):
+    """Uma casca reprovada em cobertura não se esconde na média do relatório geral."""
+    mesh, feats = _two_cubes()
+    real = pl.evaluate
+
+    def evaluate(*args, **kw):
+        report = real(*args, **kw)
+        if kw.get("name", "").endswith("casca 2"):
+            report.checks["crease_coverage"] = False
+            report.passed = False
+        return report
+
+    monkeypatch.setattr(pl, "evaluate", evaluate)
+    result = run_pipeline(mesh, feats, PipelineOptions(engine=FakeEngine(), target_quads=1500))
+    assert result.report.passed is False
+    assert any("casca(s) 2 não passaram" in n for n in result.report.notes)
+    # polos e proporção dependem do tamanho da casca: não reprovam o geral
+    def poles_only(*args, **kw):
+        report = real(*args, **kw)
+        if kw.get("name", "").endswith("casca 2"):
+            report.checks["poles"] = False
+            report.passed = False
+        return report
+
+    monkeypatch.setattr(pl, "evaluate", poles_only)
+    assert run_pipeline(mesh, feats, PipelineOptions(engine=FakeEngine(), target_quads=1500)).report.passed
+
+
+def test_pumped_keeps_calling_progress_and_honours_cancel(monkeypatch):
+    import threading
+    import time
+
+    monkeypatch.setattr(pl, "PUMP_INTERVAL_S", 0.02)
+    assert pl._pumped(lambda: 7, None, None, 0.5, "x") == 7  # sem progresso: roda direto
+    calls: list[tuple[float, str]] = []
+    main = threading.current_thread()
+    threads: list[bool] = []
+
+    def progress(fraction: float, message: str) -> None:
+        threads.append(threading.current_thread() is main)
+        calls.append((fraction, message))
+
+    def slow() -> str:
+        time.sleep(0.2)
+        return "pronto"
+
+    assert pl._pumped(slow, progress, lambda: False, 0.3, "Medindo") == "pronto"
+    assert len(calls) >= 4 and set(calls) == {(0.3, "Medindo")} and all(threads)
+
+    def boom() -> None:
+        raise ZeroDivisionError("conta")
+
+    with pytest.raises(ZeroDivisionError):
+        pl._pumped(boom, progress, None, 0.3, "x")
+
+    start = time.perf_counter()
+    with pytest.raises(EngineCancelled):
+        pl._pumped(lambda: time.sleep(2.0), progress, lambda: True, 0.3, "x")
+    assert time.perf_counter() - start < 1.0
+
+
+# --------------------------------------------------------------------------
 # Camada Maya com um Maya de mentira
 # --------------------------------------------------------------------------
 
 
 class FakeMayaScene:
-    """Registra as chamadas ao ``maya.cmds`` e ao ``maya_bridge`` de mentira."""
+    """Registra as chamadas ao ``maya.cmds`` e ao ``maya_bridge`` de mentira.
+
+    As consultas (``ls``, ``xform``, ``objExists``) não entram em ``calls``.
+    ``undo_on`` acompanha o estado do desfazer; ``matrix`` é a matriz de mundo
+    devolvida pelo ``xform``; ``current_path`` é onde o UUID do original
+    aponta agora (``None`` = o original sumiu).
+    """
 
     def __init__(
         self,
@@ -562,20 +816,57 @@ class FakeMayaScene:
         reduced_feats: FeatureSet | None = None,
     ) -> None:
         self.calls: list[tuple] = []
+        self.undo_on = True
+        self.matrix = [1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
+        self.current_path: str | None = "|cubo"
+        self.selection = ["|cubo"]
+        self.reduce_error: Exception | None = None
+        self.fail_on: str | None = None
         cmds = types.ModuleType("maya.cmds")
 
         def undo_info(**flags):
             if flags.get("query"):
-                return True
+                return self.undo_on
+            if "stateWithoutFlush" in flags:
+                self.undo_on = bool(flags["stateWithoutFlush"])
             self.calls.append(("undoInfo", flags))
             return None
 
+        def ls(*args, **flags):
+            if flags.get("selection"):
+                return list(self.selection)
+            if flags.get("uuid"):
+                return ["UUID-CUBO"]
+            if args and args[0] == "UUID-CUBO":
+                return [self.current_path] if self.current_path else []
+            return list(args)
+
+        def select(*args, **flags):
+            self.calls.append(("select", args, flags))
+            if flags.get("clear"):
+                self.selection = []
+            elif args:
+                self.selection = list(args[0]) if isinstance(args[0], list) else [args[0]]
+
+        def poly_reduce(name, **flags):
+            self.calls.append(("polyReduce", name, flags))
+            if self.reduce_error is not None:
+                raise self.reduce_error
+
+        def duplicate(node, **flags):
+            self.calls.append(("duplicate", node, flags))
+            self.selection = ["|copia"]
+            return ["|copia"]
+
         cmds.undoInfo = undo_info
-        cmds.duplicate = lambda node, **kw: self.calls.append(("duplicate", node, kw)) or ["|copia"]
-        cmds.objExists = lambda name: True
+        cmds.ls = ls
+        cmds.xform = lambda node, **kw: list(self.matrix)
+        cmds.duplicate = duplicate
+        cmds.objExists = lambda name: name != "|sumiu"
         cmds.delete = lambda *a, **kw: self.calls.append(("delete", a, kw))
-        cmds.select = lambda *a, **kw: self.calls.append(("select", a, kw))
-        cmds.polyReduce = lambda name, **kw: self.calls.append(("polyReduce", name, kw))
+        cmds.select = select
+        cmds.polyReduce = poly_reduce
+        cmds.polyCrease = lambda components, **kw: self.calls.append(("polyCrease", list(components), kw))
         maya = types.ModuleType("maya")
         maya.cmds = cmds
 
@@ -595,11 +886,21 @@ class FakeMayaScene:
             finally:
                 self.calls.append(("chunk_end",))
 
+        def step(label, result=None):
+            def call(*args):
+                if self.fail_on == label:
+                    raise RuntimeError(f"{label} falhou")
+                self.calls.append((label, *args))
+                return result(*args) if result else None
+
+            return call
+
         bridge.mesh_from_maya = read
         bridge.undo_chunk = undo_chunk
-        bridge.create_mesh = lambda mesh, name: self.calls.append(("create", mesh.num_faces, name)) or "|" + name
-        bridge.set_hard_edges = lambda name, pairs: self.calls.append(("hard", name, len(pairs)))
-        bridge.copy_material = lambda source, target: self.calls.append(("material", source, target))
+        bridge.create_mesh = lambda mesh, name: self.calls.append(("create", mesh, name)) or "|" + name
+        bridge.set_hard_edges = step("hard", lambda name, pairs: None)
+        bridge.copy_material = step("material")
+        bridge.edge_components = lambda name, pairs: [f"{name}.e[0:{len(pairs) - 1}]"] if len(pairs) else []
         monkeypatch.setitem(sys.modules, "maya", maya)
         monkeypatch.setitem(sys.modules, "maya.cmds", cmds)
         monkeypatch.setitem(sys.modules, "toptop.maya_bridge", bridge)
@@ -616,35 +917,60 @@ class FakeMayaScene:
         """Só o nome de cada chamada, na ordem."""
         return [c[0] for c in self.calls]
 
+    def named(self, name: str) -> list[tuple]:
+        """Só as chamadas com este nome."""
+        return [c for c in self.calls if c[0] == name]
+
+
+def _signed_volume(mesh: Mesh) -> float:
+    """Volume com sinal (positivo = normais para fora) de uma malha fechada."""
+    tri = triangle_mesh(mesh)
+    p = tri.points[tri.connects.reshape(-1, 3)]
+    return float(np.einsum("ij,ij->i", p[:, 0], np.cross(p[:, 1], p[:, 2])).sum() / 6.0)
+
 
 def test_maya_retopologize_without_reduction(monkeypatch):
     mesh, feats = _cube_input()
     scene = FakeMayaScene(monkeypatch, mesh, feats)
-    new, result = maya_retopologize("|grupo|cubo", PipelineOptions(engine=FakeEngine(), target_quads=600))
+    steps: list[float] = []
+
+    def progress(fraction: float, message: str) -> None:
+        assert scene.undo_on, "a interface processou eventos com o desfazer desligado"
+        steps.append(fraction)
+
+    new, result = maya_retopologize(
+        "|grupo|cubo", PipelineOptions(engine=FakeEngine(), target_quads=600), progress=progress
+    )
     assert new == "|cubo_toptop" and isinstance(result, PipelineResult)
-    assert scene.names() == [
-        "read", "undoInfo", "undoInfo", "chunk", "create", "hard", "material", "select", "chunk_end",
-    ]  # fmt: skip
+    # sem redução e com motor de fora do Maya, o desfazer nunca é desligado
+    assert scene.names() == ["read", "chunk", "create", "hard", "material", "select", "chunk_end"]
     assert scene.calls[0] == ("read", "|cubo", True)
-    assert scene.calls[1][1] == {"stateWithoutFlush": False} and scene.calls[2][1] == {"stateWithoutFlush": True}
-    assert scene.calls[4] == ("create", 600, "cubo_toptop")
-    assert scene.calls[5] == ("hard", "|cubo_toptop", 120)
-    assert scene.calls[6] == ("material", "|cubo", "|cubo_toptop")
-    assert scene.calls[7][1] == ("|cubo_toptop",) and scene.calls[7][2] == {"replace": True}
+    assert scene.calls[2][1] is result.mesh and scene.calls[2][2] == "cubo_toptop"
+    assert scene.calls[3][1] == "|cubo_toptop" and len(scene.calls[3][2]) == 120
+    assert scene.calls[4][1:] == ("|cubo", "|cubo_toptop")
+    assert scene.calls[5][1] == ("|cubo_toptop",) and scene.calls[5][2] == {"replace": True}
+    assert not scene.named("polyCrease")  # Game: hard edges, sem creases
+    assert steps[-1] == 1.0
 
 
-def test_maya_retopologize_reduces_a_copy_and_film_is_all_soft(monkeypatch):
+def test_maya_retopologize_reduces_a_copy_and_film_writes_creases(monkeypatch):
     original = triangle_mesh(shapes.cube(4))
     feats = FeatureSet(shapes.cube_feature_edges(original))
     reduced = triangle_mesh(shapes.cube(2))
     scene = FakeMayaScene(monkeypatch, original, feats, reduced, FeatureSet.empty())
+    scene.selection = ["|cubo", "|outro"]
     engine = FakeEngine()
     options = PipelineOptions(engine=engine, target_quads=600, reduce_limit=50, mode="film")
     steps: list[float] = []
-    new, result = maya_retopologize("cubo", options, progress=lambda f, m: steps.append(f))
+
+    def progress(fraction: float, message: str) -> None:
+        assert scene.undo_on, "a interface processou eventos com o desfazer desligado"
+        steps.append(fraction)
+
+    new, result = maya_retopologize("cubo", options, progress=progress)
     names = scene.names()
-    assert names[:2] == ["read", "undoInfo"]
-    assert names[2:7] == ["duplicate", "polyReduce", "delete", "read", "delete"]
+    assert names[:8] == ["read", "undoInfo", "duplicate", "polyReduce", "delete", "read", "delete", "select"]
+    assert scene.calls[1][1] == {"stateWithoutFlush": False}
     assert scene.calls[2][2] == {"name": "cubo_toptopReduzida", "returnRootsOnly": True}
     reduce_name, flags = scene.calls[3][1], scene.calls[3][2]
     assert reduce_name == "|copia|copiaShape"
@@ -652,12 +978,110 @@ def test_maya_retopologize_reduces_a_copy_and_film_is_all_soft(monkeypatch):
     assert flags["keepBorderWeight"] == 1.0 and flags["constructionHistory"] is False
     assert scene.calls[5] == ("read", "|copia", True)  # leitura da cópia reduzida
     assert scene.calls[6][1] == ("|copia",) and scene.calls[6][2] == {}  # cópia apagada
-    assert names[7:] == ["undoInfo", "chunk", "create", "hard", "material", "select", "chunk_end"]
-    assert scene.calls[10] == ("hard", "|cubo_toptop", 0)  # Film: tudo suave
+    # a seleção do usuário volta, ainda sem gravar desfazer; depois o desfazer religa
+    assert scene.calls[7][1] == (["|cubo", "|outro"],) and scene.calls[7][2] == {"replace": True}
+    assert scene.calls[8] == ("undoInfo", {"stateWithoutFlush": True})
+    assert names[9:] == ["chunk", "create", "hard", "polyCrease", "material", "select", "chunk_end"]
+    assert len(scene.calls[11][2]) == 0  # Film: tudo suave
+    # Film: os loops de feature viram crease (todos fortes aqui: 3.0)
+    crease = scene.calls[12]
+    assert crease[1] == ["|cubo_toptop.e[0:119]"] and crease[2] == {"value": 3.0}
+    assert any("Creases gravadas para o Film: 120 aresta(s)" in n for n in result.notes)
     # o motor viu a cópia reduzida, com as creases transferidas do original
     assert engine.calls[0]["faces"] == reduced.num_faces and engine.calls[0]["features"] == 24
     assert result.report.ref_triangles == original.num_faces
     assert steps[-1] == 1.0 and all(b >= a for a, b in zip(steps, steps[1:]))
+
+
+def test_maya_film_creases_follow_the_threshold(monkeypatch):
+    plane = shapes.grid_plane(4, 4)
+    scene = FakeMayaScene(monkeypatch, plane, FeatureSet(np.array([[0, 1], [1, 2]]), np.array([4.0, 4.0])))
+    options = PipelineOptions(engine=FakeEngine(), target_quads=100, mode="film", strong_threshold=4.0)
+    _, result = maya_retopologize("cubo", options)
+    values = sorted(c[2]["value"] for c in scene.named("polyCrease"))
+    assert values == [1.0, 4.0]  # guia (bordas) e forte, os dois lidos de volta como tal com limiar 4
+    assert int(result.crease_edges.strong_mask(4.0).sum()) == len(result.hard_edges) > 0
+    assert int(result.crease_edges.guide_mask(4.0).sum()) > 0
+
+
+def test_maya_nonmanifold_original_fails_before_reducing(monkeypatch):
+    pts = [(9, 9, 9), (0, 0, 0), (1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1)]
+    bad = Mesh.from_faces(pts, [(1, 2, 3), (2, 1, 4), (1, 2, 5)])
+    scene = FakeMayaScene(monkeypatch, bad, FeatureSet.empty(), bad, FeatureSet.empty())
+    with pytest.raises(PipelineError) as info:
+        maya_retopologize("cubo", PipelineOptions(engine=FakeEngine(), reduce_limit=2))
+    assert info.value.stage == "validar" and info.value.edges.tolist() == [[1, 2]]
+    assert scene.names() == ["read"]  # nem duplicou: o Reduce nem chegou a rodar
+
+
+def test_maya_reduce_failure_is_a_pipeline_error_and_cleans_up(monkeypatch):
+    original = triangle_mesh(shapes.cube(4))
+    scene = FakeMayaScene(monkeypatch, original, FeatureSet.empty(), original, FeatureSet.empty())
+    scene.reduce_error = RuntimeError("Cannot reduce polygonal object with non-manifold geometry")
+    with pytest.raises(PipelineError) as info:
+        maya_retopologize("cubo", PipelineOptions(engine=FakeEngine(), reduce_limit=50))
+    assert info.value.stage == "reduzir"
+    assert "Reduce do Maya falhou" in str(info.value) and "Limite de redução" in str(info.value)
+    assert scene.names() == ["read", "undoInfo", "duplicate", "polyReduce", "delete", "select", "undoInfo"]
+    assert scene.calls[4][1] == ("|copia",)
+    assert scene.selection == ["|cubo"] and scene.undo_on
+
+
+def test_maya_mirrored_object_is_read_with_faces_turned_outward(monkeypatch):
+    mesh, feats = _cube_input()
+    # espelhado em X: o Maya devolve os pontos espelhados com as faces na mesma ordem
+    world = mesh.with_points(mesh.points * np.array([-1.0, 1.0, 1.0]))
+    assert _signed_volume(world) < 0
+    scene = FakeMayaScene(monkeypatch, world, feats)
+    scene.matrix = [-1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0, 0, 0, 0, 0, 1.0]
+    engine = FakeEngine()
+    _, result = maya_retopologize("cubo", PipelineOptions(engine=engine, target_quads=600))
+    assert _signed_volume(engine.calls[0]["mesh"]) > 0
+    assert any("espelhado" in n for n in result.notes)
+    assert result.report.passed
+
+    scene = FakeMayaScene(monkeypatch, mesh, feats)
+    engine = FakeEngine()
+    _, result = maya_retopologize("cubo", PipelineOptions(engine=engine, target_quads=600))
+    assert _signed_volume(engine.calls[0]["mesh"]) > 0
+    assert not any("espelhado" in n for n in result.notes)
+
+
+def test_reverse_winding():
+    box = shapes.cube(2)
+    flipped = pl.reverse_winding(box)
+    assert flipped.faces() == [f[::-1] for f in box.faces()]
+    assert np.array_equal(pl.reverse_winding(flipped).connects, box.connects)
+    assert _signed_volume(box) == pytest.approx(1.0) and _signed_volume(flipped) == pytest.approx(-1.0)
+    mixed = Mesh.from_faces(box.points, [(0, 1, 2), (3, 4, 5, 6, 7)])
+    assert pl.reverse_winding(mixed).faces() == [(2, 1, 0), (7, 6, 5, 4, 3)]
+
+
+@pytest.mark.parametrize("fail_on", ["hard", "material"])
+def test_maya_failure_after_creating_deletes_the_new_object(monkeypatch, fail_on):
+    mesh, feats = _cube_input()
+    scene = FakeMayaScene(monkeypatch, mesh, feats)
+    scene.fail_on = fail_on
+    with pytest.raises(RuntimeError, match="falhou"):
+        maya_retopologize("cubo", PipelineOptions(engine=FakeEngine(), target_quads=600))
+    names = scene.names()
+    assert names[-2:] == ["delete", "chunk_end"]
+    assert scene.calls[-2][1] == ("|cubo_toptop",)
+    assert "select" not in names
+
+
+def test_maya_material_follows_the_original_by_uuid(monkeypatch):
+    mesh, feats = _cube_input()
+    scene = FakeMayaScene(monkeypatch, mesh, feats)
+    scene.current_path = "|grupo|cuboRenomeado"  # renomeado e com outro pai durante a execução
+    maya_retopologize("cubo", PipelineOptions(engine=FakeEngine(), target_quads=600))
+    assert scene.named("material")[0][1:] == ("|grupo|cuboRenomeado", "|cubo_toptop")
+
+    scene = FakeMayaScene(monkeypatch, mesh, feats)
+    scene.current_path = None
+    new, result = maya_retopologize("|sumiu", PipelineOptions(engine=FakeEngine(), target_quads=600))
+    assert new == "|sumiu_toptop" and not scene.named("material")
+    assert any("material não foi copiado" in n for n in result.notes)
 
 
 def test_maya_retopologize_cancel_creates_nothing(monkeypatch):
@@ -667,7 +1091,7 @@ def test_maya_retopologize_cancel_creates_nothing(monkeypatch):
         maya_retopologize("cubo", PipelineOptions(engine=FakeEngine()), cancel=lambda: True)
     assert scene.names() == ["read"]
 
-    # cancelado já dentro do pipeline: a gravação de desfazer volta a ligar
+    # cancelado já dentro do pipeline: nada criado e o desfazer nunca foi desligado
     scene = FakeMayaScene(monkeypatch, mesh, feats)
     asked: list[int] = []
 
@@ -677,14 +1101,60 @@ def test_maya_retopologize_cancel_creates_nothing(monkeypatch):
 
     with pytest.raises(EngineCancelled):
         maya_retopologize("cubo", PipelineOptions(engine=FakeEngine()), cancel=cancel_second_time)
-    assert scene.names() == ["read", "undoInfo", "undoInfo"]
-    assert scene.calls[-1][1] == {"stateWithoutFlush": True}
+    assert scene.names() == ["read"] and scene.undo_on
+
+
+class MayaFakeEngine(FakeEngine):
+    """Motor falso que "roda dentro do Maya": confere o desfazer e o que recebeu."""
+
+    requires_maya = True
+
+    def __init__(self, scene: FakeMayaScene) -> None:
+        super().__init__()
+        self.scene = scene
+        self.seen: list[tuple] = []
+
+    def remesh(self, mesh, feature_edges, density, *, cancel=None, progress=None) -> Mesh:
+        """Registra o estado do desfazer e os callbacks recebidos."""
+        self.seen.append((self.scene.undo_on, cancel, progress))
+        return super().remesh(mesh, feature_edges, density, cancel=cancel, progress=progress)
+
+
+def test_maya_engine_runs_without_undo_and_without_events(monkeypatch):
+    mesh, feats = _cube_input()
+    scene = FakeMayaScene(monkeypatch, mesh, feats)
+    engine = MayaFakeEngine(scene)
+    events: list[bool] = []
+
+    def progress(fraction: float, message: str) -> None:
+        events.append(scene.undo_on)
+
+    def cancel() -> bool:
+        events.append(scene.undo_on)
+        return False
+
+    run_pipeline(mesh, feats, PipelineOptions(engine=engine, target_quads=600), progress=progress, cancel=cancel)
+    assert engine.seen == [(False, None, None)]
+    assert all(events) and scene.undo_on
+    assert scene.named("undoInfo") == [
+        ("undoInfo", {"stateWithoutFlush": False}),
+        ("undoInfo", {"stateWithoutFlush": True}),
+    ]
 
 
 def test_maya_estimate(monkeypatch):
     mesh, feats = _cube_input()
     FakeMayaScene(monkeypatch, mesh, feats)
     assert maya_estimate("cubo", 4, "film") == estimate_quads(mesh, 4, "film")
+    area, diagonal = pl.maya_estimate_inputs("cubo")
+    assert area == pytest.approx(6.0) and diagonal == pytest.approx(np.sqrt(3.0))
+    for detail in range(DETAIL_MIN, DETAIL_MAX + 1):
+        for mode in MODES:
+            assert pl.estimate_from(area, diagonal, detail, mode) == estimate_quads(mesh, detail, mode)
+    assert pl.estimate_from(0.0, 1.0, 5) == MIN_SHELL_QUADS
+    assert pl.estimate_from(float("nan"), 1.0, 5) == MIN_SHELL_QUADS
+    with pytest.raises(ValueError):
+        pl.estimate_from(1.0, 1.0, 0)
 
 
 # --------------------------------------------------------------------------
@@ -708,3 +1178,23 @@ def test_real_quadwild_pipeline_on_a_cube(tmp_path):
     lo, hi = np.zeros(3), np.ones(3)
     assert _on_box_edges(result.mesh.points[result.hard_edges.reshape(-1)], lo, hi).all()
     assert _length(result.mesh, result.hard_edges) == pytest.approx(12.0, rel=1e-6)
+
+
+@pytest.mark.skipif(
+    not (os.environ.get(qw.INSTALL_ENV) and qw.find_install()), reason="binários reais do QuadWild não instalados"
+)
+def test_real_quadwild_with_stray_triangle_and_flat_shell(tmp_path):
+    """O QuadWild trava em casca plana e em triângulo solto: com o pipeline, nada chega ao tempo limite."""
+    cube = triangle_mesh(shapes.cube(6))
+    plane = shapes.translated(triangle_mesh(shapes.grid_plane(10, 10)), (3.0, 0.0, 0.0))
+    stray = shapes.translated(_loose_triangle(), (3.0, 0.0, 0.0))
+    mesh = shapes.combine(cube, plane, stray)
+    feats = FeatureSet(shapes.cube_feature_edges(cube))
+    options = PipelineOptions(target_quads=800, timeout_s=60.0, engine_options={"workdir_root": str(tmp_path)})
+    result = run_pipeline(mesh, feats, options)
+    assert result.shell_status == [pl.SHELL_ENGINE, pl.SHELL_ENGINE, pl.SHELL_DIRECT]
+    assert result.engine_seconds < 60.0
+    report = result.report
+    assert report.quad_ratio == 1.0 and report.shells == 3
+    assert report.crease_coverage > 0.99 and report.hausdorff < 1e-3
+    assert report.passed, (report.checks, report.notes)

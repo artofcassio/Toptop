@@ -11,10 +11,16 @@ Maya) e a malha de referência (o original), e faz, nesta ordem:
 4. **creases -> features**, com as bordas abertas como feature guia (sem
    crease nenhuma, as quinas acima de ``suggest_angle`` viram crease forte);
 5. **simetria**: fica para a Fase 2 (a opção só gera uma nota);
-6. **motor** em cada casca, com o número de quads dividido pela área;
-7. **reprojeção** do resultado na referência inteira (``reproject.reproject``);
+6. **motor** em cada casca, com o número de quads dividido pela área. Casca
+   com menos de ``MIN_ENGINE_TRIANGLES`` triângulos não vai para o motor (cada
+   triângulo vira 3 quads, sem mudar a forma); casca plana roda no QuadWild
+   sem o remesh (com ele o motor trava em superfície plana); se o motor falha
+   numa casca, as outras seguem e a que falhou também vira quads direto;
+7. **reprojeção** de cada casca na casca correspondente do original
+   (``reproject.reproject``), para uma peça não grudar na vizinha;
 8. **pós-processo**: hard edges = arestas do resultado sobre creases fortes;
-   creases para o Film = todos os loops de feature (3.0 forte, 1.0 guia);
+   creases para o Film = todos os loops de feature (forte e guia, com os
+   valores que o limiar escolhido lê como forte e guia);
 9. **juntar** as cascas e **medir** contra a referência limpa.
 
 As funções ``maya_*`` no fim do arquivo são a camada fina que lê a malha do
@@ -24,16 +30,18 @@ Maya, reduz uma cópia quando precisa e cria o objeto novo; elas importam
 
 from __future__ import annotations
 
+import copy
 import math
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Callable, Iterator
+from typing import Any, Callable, Iterator, TypeVar
 
 import numpy as np
 
 from ..engine import ENGINE_NAMES, get_engine
-from ..engine.base import Density, Engine, EngineCancelled, EngineError
+from ..engine.base import Density, Engine, EngineCancelled, EngineError, EngineUnavailable
 from .cleanup import (
     DEFAULT_TRIANGLE_LIMIT,
     DEFAULT_WELD_TOL_REL,
@@ -41,6 +49,7 @@ from .cleanup import (
     Shell,
     _corner_next,
     clean_mesh,
+    compact_vertices,
     num_triangles,
     reduction_target,
     split_shells,
@@ -55,12 +64,14 @@ from .creases import (
     suggest_creases,
 )
 from .geom import point_grid
-from .mesh import Mesh
-from .quality import QualityReport, evaluate, match_features
+from .mesh import Mesh, face_centers
+from .quality import QualityReport, evaluate, face_counts, match_features
+from .reproject import KIND_CORNER, KIND_CURVE, KIND_SURFACE, KIND_UNTOUCHED, ReprojectResult
 from .reproject import reproject as reproject_mesh
 
 ProgressFn = Callable[[float, str], None]
 CancelFn = Callable[[], bool]
+_T = TypeVar("_T")
 
 MODES = ("game", "film")
 DETAIL_MIN = 1
@@ -76,6 +87,19 @@ EDGE_STEP = 0.75
 FILM_FACTOR = 2.5
 #: mínimo de quads pedido ao motor por casca
 MIN_SHELL_QUADS = 24
+#: casca com menos triângulos que isto não vai para o motor (vira quads direto)
+MIN_ENGINE_TRIANGLES = 8
+#: casca com todos os vértices a até esta fração da diagonal de um plano é plana
+FLAT_TOL_REL = 1e-4
+#: o que aconteceu com cada casca (``PipelineResult.shell_status``)
+SHELL_ENGINE = "motor"
+SHELL_DIRECT = "direto"
+SHELL_FAILED = "falhou"
+#: metas por casca que também valem para o resultado geral (polos, proporção e
+#: tempo dependem do tamanho da casca e ficam só no relatório dela)
+SHELL_REQUIRED_CHECKS = ("quads", "crease_coverage", "feature_fidelity")
+#: de quanto em quanto tempo (s) a interface é atualizada durante uma etapa longa
+PUMP_INTERVAL_S = 0.1
 #: passadas da reprojeção (a segunda acha mais vértices de loop)
 REPROJECT_ITERATIONS = 2
 #: amostras do Hausdorff no relatório geral (cada casca recebe a sua parte)
@@ -209,6 +233,8 @@ class PipelineResult:
     ``hard_edges`` e ``crease_edges`` são pares de vértices de ``mesh``;
     ``report`` mede ``mesh`` contra a referência limpa e ``shell_reports`` traz
     um relatório por casca, contra a casca correspondente da referência.
+    ``report.passed`` também exige que nenhuma casca tenha falhado no motor e
+    que cada casca do motor passe em ``SHELL_REQUIRED_CHECKS``.
     ``seconds`` é o tempo total; ``engine_seconds``, só o do motor.
     """
 
@@ -220,9 +246,12 @@ class PipelineResult:
     notes: list[str] = field(default_factory=list)
     seconds: float = 0.0
     engine_seconds: float = 0.0
-    #: total de quads pedido ao motor e a parte de cada casca
+    #: total de quads pedido ao motor e a parte de cada casca (0 = não foi para o motor)
     target_quads: int = 0
     shell_targets: list[int] = field(default_factory=list)
+    #: ``SHELL_ENGINE``, ``SHELL_DIRECT`` (pequena demais: quads direto) ou
+    #: ``SHELL_FAILED`` (o motor falhou: quads direto) para cada casca
+    shell_status: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------
@@ -241,24 +270,29 @@ def surface_area(mesh: Mesh) -> float:
     return float(0.5 * np.linalg.norm(vec, axis=1).sum())
 
 
-def estimate_quads(mesh: Mesh, detail: int, mode: str = "game") -> int:
-    """Número de quads para um nível de detalhe (1 a 10).
+def estimate_from(area: float, diagonal: float, detail: int, mode: str = "game") -> int:
+    """Número de quads para um nível de detalhe (1 a 10), dados a área e a diagonal.
 
     Lado do quad L = diagonal x 0,1 x 0,75^(detalhe - 1); quads = área / L²;
-    o Film pede 2,5 vezes mais. Nunca menos que 24. Rápido: não monta a
-    topologia da malha.
+    o Film pede 2,5 vezes mais. Nunca menos que 24.
     """
     _check_detail(detail)
     _check_mode(mode)
-    diagonal = mesh.diagonal()
-    area = surface_area(mesh)
-    if not diagonal > 0 or not area > 0:
+    area, diagonal = float(area), float(diagonal)
+    if not diagonal > 0 or not area > 0 or not math.isfinite(area) or not math.isfinite(diagonal):
         return MIN_SHELL_QUADS
     edge = diagonal * BASE_EDGE_REL * EDGE_STEP ** (int(detail) - 1)
     quads = area / (edge * edge)
     if mode == "film":
         quads *= FILM_FACTOR
     return max(MIN_SHELL_QUADS, int(round(quads)))
+
+
+def estimate_quads(mesh: Mesh, detail: int, mode: str = "game") -> int:
+    """``estimate_from`` com a área e a diagonal da malha. Rápido: não monta a topologia."""
+    _check_detail(detail)
+    _check_mode(mode)
+    return estimate_from(surface_area(mesh), mesh.diagonal(), detail, mode)
 
 
 def shell_targets(total: int, areas: np.ndarray, minimum: int = MIN_SHELL_QUADS) -> list[int]:
@@ -390,7 +424,10 @@ def _require_manifold(input_mesh: Mesh, clean: CleanResult, stage: str, what: st
         parts.append(f"{len(clean.nonmanifold_vertices)} vértice(s) ligando faces só pela ponta")
     message = f"{what} é non-manifold ({' e '.join(parts)}). Corrija a malha antes de retopologizar."
     if stage == "reduzir":
-        message += " Tente aumentar o limite de redução para o Maya reduzir menos."
+        message += (
+            " Aumente o limite de redução na janela (Limite de redução) para o Maya reduzir menos;"
+            " por script, passe PipelineOptions(reduce_limit=...)."
+        )
     raise PipelineError(message, edges=edges, stage=stage, vertices=vertices)
 
 
@@ -472,6 +509,207 @@ def _run_engine(
     return result
 
 
+def _run_shell(
+    engine: Engine,
+    shell: Shell,
+    target: int,
+    label: str,
+    cancel: CancelFn | None,
+    progress: ProgressFn | None,
+) -> Mesh:
+    """Roda o motor numa casca; um motor que roda dentro do Maya fica sem desfazer e sem eventos.
+
+    A malha temporária do motor do Maya não pode entrar na fila de desfazer.
+    Com o desfazer desligado, nada pode processar eventos da interface (o
+    usuário mexeria na cena sem o desfazer gravar), então esse motor roda sem
+    ``progress`` e sem ``cancel``, que processam eventos na janela.
+    """
+    if not getattr(engine, "requires_maya", False):
+        return _run_engine(engine, shell, target, label, cancel, progress)
+    with _maya_undo_suspended():
+        return _run_engine(engine, shell, target, label, None, None)
+
+
+def _pumped(
+    work: Callable[[], _T],
+    progress: ProgressFn | None,
+    cancel: CancelFn | None,
+    fraction: float,
+    message: str,
+) -> _T:
+    """Roda uma etapa longa (só NumPy, sem Maya) sem congelar a interface.
+
+    Sem ``progress``, roda direto. Com ele, a etapa roda numa thread de
+    trabalho enquanto esta chama ``progress`` a cada ``PUMP_INTERVAL_S`` (é aí
+    que a janela processa eventos) e confere o cancelamento; cancelada, a
+    função levanta ``EngineCancelled`` na hora e o resultado da thread é
+    descartado.
+    """
+    if progress is None:
+        return work()
+    _report(progress, fraction, message)
+    box: dict[str, Any] = {}
+
+    def run() -> None:
+        """Corpo da thread: guarda o resultado ou o erro."""
+        try:
+            box["value"] = work()
+        except BaseException as error:  # repassado na thread principal
+            box["error"] = error
+
+    thread = threading.Thread(target=run, name="toptop-pipeline", daemon=True)
+    thread.start()
+    while True:
+        thread.join(PUMP_INTERVAL_S)
+        if not thread.is_alive():
+            break
+        _report(progress, fraction, message)
+        _check_cancel(cancel)
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def split_into_quads(mesh: Mesh) -> Mesh:
+    """Cada face de n lados vira n quads: vértice, meio da aresta, centro da face, meio da aresta.
+
+    Subdivisão linear, sem mover nada: a forma é a mesma, cada aresta original
+    vira duas arestas em linha (uma crease continua sendo um loop) e o
+    resultado é 100% quads, com o mesmo sentido das faces. Serve para a casca
+    pequena demais para o motor e para a casca em que o motor falhou.
+    """
+    if mesh.num_faces == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return Mesh(np.zeros((0, 3)), empty, empty.copy(), mesh.name)
+    topo = mesh.topology
+    n = mesh.num_points
+    edges = topo.edges
+    mids = 0.5 * (mesh.points[edges[:, 0]] + mesh.points[edges[:, 1]])
+    points = np.concatenate([mesh.points, mids, face_centers(mesh)])
+    nxt = topo.corner_next
+    prev = np.empty_like(nxt)
+    prev[nxt] = np.arange(len(nxt), dtype=np.int64)
+    quads = np.stack(
+        [mesh.connects, n + topo.corner_edge, n + len(edges) + topo.corner_face, n + topo.corner_edge[prev]],
+        axis=1,
+    )
+    out = Mesh(points, np.full(len(quads), 4, dtype=np.int64), quads.reshape(-1), mesh.name)
+    return compact_vertices(out)[0]
+
+
+def reverse_winding(mesh: Mesh) -> Mesh:
+    """Cópia com todas as faces percorridas ao contrário (as normais apontam para o outro lado).
+
+    Vértices e ordem das faces não mudam; as arestas também são as mesmas.
+    """
+    if mesh.num_faces == 0:
+        return Mesh(mesh.points, mesh.counts, mesh.connects, mesh.name)
+    start = np.repeat(mesh.offsets[:-1], mesh.counts)
+    local = np.arange(mesh.connects.size, dtype=np.int64) - start
+    target = start + np.repeat(mesh.counts, mesh.counts) - 1 - local
+    connects = np.empty_like(mesh.connects)
+    connects[target] = mesh.connects
+    return Mesh(mesh.points, mesh.counts, connects, mesh.name)
+
+
+def is_flat(mesh: Mesh, tol_rel: float = FLAT_TOL_REL) -> bool:
+    """Verdadeiro se todos os vértices usados estão a até ``tol_rel * diagonal`` de um mesmo plano."""
+    if mesh.num_faces == 0:
+        return True
+    pts = mesh.points[np.unique(mesh.connects)]
+    diagonal = float(np.linalg.norm(pts.max(axis=0) - pts.min(axis=0)))
+    if len(pts) < 4 or not diagonal > 0:
+        return True
+    centered = pts - pts.mean(axis=0)
+    _, vectors = np.linalg.eigh(centered.T @ centered)
+    return float(np.abs(centered @ vectors[:, 0]).max()) <= float(tol_rel) * diagonal
+
+
+def _flat_shell_engine(engine: Engine) -> Engine:
+    """Motor para uma casca plana: o QuadWild roda numa cópia sem o remesh; os outros, como estão.
+
+    O remesh do QuadWild tira a escala da curvatura, que é zero numa
+    superfície plana, e não termina (até o tempo limite). Sem ele, o motor
+    trabalha direto nos triângulos da casca e termina em menos de um segundo.
+    """
+    from ..engine.quadwild import QuadWildEngine
+
+    if isinstance(engine, QuadWildEngine) and engine.do_remesh:
+        clone = copy.copy(engine)
+        clone.do_remesh = False
+        return clone
+    return engine
+
+
+def _reference_shells(
+    shell_list: list[Shell], same: bool, ref_mesh: Mesh, ref_feats: FeatureSet
+) -> tuple[list[Shell], list[int]]:
+    """Cascas da referência e, para cada casca do motor, o índice da correspondente."""
+    if same:
+        return shell_list, list(range(len(shell_list)))
+    if len(shell_list) == 1:
+        whole = Shell(
+            ref_mesh,
+            ref_feats,
+            np.arange(ref_mesh.num_points, dtype=np.int64),
+            np.arange(ref_mesh.num_faces, dtype=np.int64),
+        )
+        return [whole], [0]
+    ref_shells = split_shells(ref_mesh, ref_feats)
+    return ref_shells, _reference_shell_index(shell_list, ref_shells, ref_mesh)
+
+
+def _reprojection_notes(reps: list[ReprojectResult]) -> list[str]:
+    """Resumo da reprojeção (com uma casca só, as mensagens dela mesma)."""
+    if len(reps) == 1:
+        return list(reps[0].messages)
+    counts = {k: sum(int((r.kind == k).sum()) for r in reps) for k in (KIND_SURFACE, KIND_CURVE, KIND_CORNER)}
+    notes = [
+        f"Reprojeção (cada casca na casca correspondente do original): {counts[KIND_SURFACE]} vértice(s) "
+        f"na superfície, {counts[KIND_CURVE]} em curvas de feature e {counts[KIND_CORNER]} em cantos."
+    ]
+    missing = sum(int(r.corners_missing) for r in reps)
+    if missing:
+        notes.append(
+            f"{missing} canto(s) de feature sem vértice de loop por perto; a quina pode sair arredondada ou cortada."
+        )
+    far = sum(int((r.mesh.topology.used_vertex & (r.kind == KIND_UNTOUCHED)).sum()) for r in reps)
+    if far:
+        notes.append(
+            f"{far} vértice(s) ficaram parados: o destino passava do deslocamento máximo da reprojeção."
+        )
+    return notes
+
+
+def _unmeasured_report(piece: Mesh, name: str) -> QualityReport:
+    """Relatório de uma casca convertida direto em quads: só as contagens (ela não é medida sozinha)."""
+    counts = face_counts(piece)
+    report = QualityReport(
+        name=name,
+        engine="direto",
+        vertices=int(np.unique(piece.connects).size),
+        faces=int(counts["faces"]),
+        quads=int(counts["quads"]),
+        triangles=int(counts["triangles"]),
+        ngons=int(counts["ngons"]),
+        quad_ratio=float(counts["quad_ratio"]),
+        shells=1,
+    )
+    report.notes.append("Casca convertida direto em quads, sem o motor; ela entra na medida do resultado geral.")
+    return report
+
+
+def _list_shells(numbers: list[int], limit: int = 10) -> str:
+    """Números das cascas para uma nota ("1, 4, 7" ou "1, 2, ... e mais 30")."""
+    shown = ", ".join(str(k) for k in numbers[:limit])
+    return shown if len(numbers) <= limit else f"{shown} e mais {len(numbers) - limit}"
+
+
+def _one_line(error: BaseException) -> str:
+    """Mensagem do erro numa linha só."""
+    return " ".join(str(error).split())
+
+
 # --------------------------------------------------------------------------
 # Pipeline
 # --------------------------------------------------------------------------
@@ -495,9 +733,12 @@ def run_pipeline(
     ``None`` = nenhuma crease marcada: as do outro lado são transferidas por
     geometria e, sem nenhuma, as quinas acima de ``suggest_angle`` viram crease
     forte; ``FeatureSet.empty()`` = sem creases de propósito. Nenhuma malha de
-    entrada é alterada. Cancelar levanta ``EngineCancelled``; falha do motor
-    levanta ``EngineError`` com o nome da casca; malha inválida levanta
-    ``PipelineError``.
+    entrada é alterada. Cancelar levanta ``EngineCancelled``; malha inválida
+    levanta ``PipelineError``. Se o motor falha numa casca, as outras seguem
+    (a que falhou vira quads direto e o relatório sai reprovado); só quando
+    nenhuma casca passou pelo motor o primeiro ``EngineError`` (com o nome da
+    casca) é levantado. Com ``progress``, as etapas longas rodam numa thread
+    de trabalho e ``progress`` é chamado a cada ``PUMP_INTERVAL_S``.
     """
     start = time.perf_counter()
     options.validate()
@@ -509,13 +750,24 @@ def run_pipeline(
         reference_features = features
 
     # 1. validar e limpar (a referência primeiro: os culpados saem na numeração do original)
-    _report(progress, 0.0, "Validando e limpando a malha")
-    ref_clean = _clean(ref_input, reference_features, options, "validar", "A malha")
+    ref_clean = _pumped(
+        lambda: _clean(ref_input, reference_features, options, "validar", "A malha"),
+        progress,
+        cancel,
+        0.0,
+        "Validando e limpando a malha",
+    )
     if same:
         eng_clean = ref_clean
     else:
         _check_cancel(cancel)
-        eng_clean = _clean(mesh, features, options, "reduzir", "A versão reduzida da malha")
+        eng_clean = _pumped(
+            lambda: _clean(mesh, features, options, "reduzir", "A versão reduzida da malha"),
+            progress,
+            cancel,
+            0.02,
+            "Validando e limpando a versão reduzida",
+        )
     notes.extend(m for m in ref_clean.messages if m not in _NO_PROBLEM_MESSAGES)
     if not same:
         notes.extend(f"Versão reduzida: {m}" for m in eng_clean.messages if m not in _NO_PROBLEM_MESSAGES)
@@ -563,115 +815,206 @@ def run_pipeline(
     if options.symmetry is not None:
         notes.append(f"Simetria fica para a Fase 2: o eixo {options.symmetry.upper()} foi ignorado.")
 
-    # 2. cascas (com as features já completas)
+    # 2. cascas (com as features já completas) e a casca correspondente da referência
     shell_list = split_shells(eng_clean.mesh, eng_feats)
     if not shell_list:
         raise PipelineError("A malha não tem nenhuma casca com faces.", stage="validar")
-    if len(shell_list) > 1:
-        notes.append(f"{len(shell_list)} cascas separadas: o motor roda uma vez em cada uma.")
+    count = len(shell_list)
+    if count > 1:
+        notes.append(f"{count} cascas separadas: o motor roda uma vez em cada uma.")
+    ref_shells, ref_index = _reference_shells(shell_list, same, ref_clean.mesh, ref_feats)
     areas = np.array([surface_area(s.mesh) for s in shell_list])
     total = int(options.target_quads) if options.target_quads is not None else estimate_quads(
         ref_clean.mesh, int(options.detail), options.mode
     )
     targets = shell_targets(total, areas)
-    if sum(targets) > total * 1.05:
+    small = [s.mesh.num_faces < MIN_ENGINE_TRIANGLES for s in shell_list]
+    flat = [not small[k] and is_flat(s.mesh) for k, s in enumerate(shell_list)]
+    engine_targets = [t for t, tiny in zip(targets, small) if not tiny]
+    if engine_targets and sum(engine_targets) > total * 1.05:
         notes.append(
-            f"Com o mínimo de {MIN_SHELL_QUADS} quads por casca, o motor recebeu {sum(targets)} quads "
+            f"Com o mínimo de {MIN_SHELL_QUADS} quads por casca, o motor recebeu {sum(engine_targets)} quads "
             f"no total (pedido: {total})."
+        )
+    tiny_ids = [k + 1 for k in range(count) if small[k]]
+    if tiny_ids:
+        notes.append(
+            f"{len(tiny_ids)} casca(s) com menos de {MIN_ENGINE_TRIANGLES} triângulos não foram para o motor: "
+            f"cada triângulo virou 3 quads, sem mudar a forma (casca(s) {_list_shells(tiny_ids)})."
         )
 
     # 6. motor em cada casca
     engine = resolve_engine(options)
     engine_label = engine.name or type(engine).__name__
+    flat_engine = _flat_shell_engine(engine) if any(flat) else engine
+    if flat_engine is not engine:
+        notes.append(
+            f"{sum(flat)} casca(s) plana(s): o QuadWild rodou nelas sem o remesh, que trava em superfície plana "
+            f"(casca(s) {_list_shells([k + 1 for k in range(count) if flat[k]])})."
+        )
     lo, hi = 0.08, 0.80
-    weights = np.asarray(targets, dtype=np.float64)
+    weights = np.where(small, 0.0, np.asarray(targets, dtype=np.float64))
+    if not weights.sum() > 0:
+        weights = np.ones(count)
     bounds = lo + (hi - lo) * np.concatenate([[0.0], np.cumsum(weights) / weights.sum()])
     results: list[Mesh] = []
     shell_seconds: list[float] = []
-    count = len(shell_list)
+    status: list[str] = []
+    failures: list[EngineError] = []
     for k, shell in enumerate(shell_list):
         _check_cancel(cancel)
         label = f"Casca {k + 1} de {count} ({shell.mesh.num_faces} triângulos)"
+        if small[k]:
+            results.append(split_into_quads(shell.mesh))
+            shell_seconds.append(0.0)
+            status.append(SHELL_DIRECT)
+            continue
         a, b = float(bounds[k]), float(bounds[k + 1])
 
         def sub_progress(fraction: float, message: str, a: float = a, b: float = b, label: str = label) -> None:
             _report(progress, a + (b - a) * min(max(float(fraction), 0.0), 1.0), f"{label}: {message}")
 
-        _report(progress, a, f"{label}: motor {engine_label}, {targets[k]} quads")
-        before = getattr(engine, "last_run", None)
+        used = flat_engine if flat[k] else engine
+        waiting = " (não dá para cancelar)" if getattr(used, "requires_maya", False) else ""
+        _report(progress, a, f"{label}: motor {engine_label}, {targets[k]} quads{waiting}")
+        before = getattr(used, "last_run", None)
         t0 = time.perf_counter()
-        out = _run_engine(engine, shell, targets[k], label, cancel, sub_progress if progress else None)
+        try:
+            out = _run_shell(used, shell, targets[k], label, cancel, sub_progress if progress else None)
+        except (EngineCancelled, EngineUnavailable):
+            raise
+        except EngineError as error:
+            shell_seconds.append(time.perf_counter() - t0)
+            failures.append(error)
+            results.append(split_into_quads(shell.mesh))
+            status.append(SHELL_FAILED)
+            notes.append(
+                f"{_one_line(error)} -> a casca foi convertida direto em quads (cada triângulo em 3); "
+                "o resto seguiu normalmente."
+            )
+            continue
         shell_seconds.append(time.perf_counter() - t0)
-        run = getattr(engine, "last_run", None)
+        run = getattr(used, "last_run", None)
         details = getattr(run, "details", None) if run is not before else None
         if isinstance(details, dict) and details.get("warning"):
             notes.append(f"{label}: {details['warning']}")
         results.append(Mesh(out.points, out.counts, out.connects, mesh.name))
+        status.append(SHELL_ENGINE)
+    if failures and SHELL_ENGINE not in status:
+        raise failures[0]
     engine_seconds = float(sum(shell_seconds))
     _check_cancel(cancel)
 
-    # 9a. juntar as cascas; 7. reprojetar tudo de uma vez na referência inteira
-    # (é o mesmo que reprojetar cada casca, mas a grade da referência é montada uma vez)
-    merged, offsets = _merge(results, ref_input.name or mesh.name)
+    # 7. reprojetar cada casca na casca correspondente do original (cada uma só
+    # enxerga a própria superfície: peças com folga pequena não grudam uma na outra).
+    # A casca convertida direto já está em cima do original, a não ser que tenha
+    # vindo da versão reduzida.
+    pieces = list(results)
     if options.reproject:
-        _report(progress, 0.82, "Reprojetando na superfície original")
-        rep = reproject_mesh(merged, ref_clean.mesh, ref_feats, iterations=REPROJECT_ITERATIONS)
-        merged = rep.mesh
-        notes.extend(rep.messages)
+        reps: list[ReprojectResult] = []
+        todo = [k for k in range(count) if status[k] == SHELL_ENGINE or not same]
+        todo_faces = max(sum(results[k].num_faces for k in todo), 1)
+        done_faces = 0
+        for k in todo:
+            _check_cancel(cancel)
+            ref_shell = ref_shells[ref_index[k]]
+            rep = _pumped(
+                lambda out=results[k], ref_shell=ref_shell: reproject_mesh(
+                    out, ref_shell.mesh, ref_shell.features, iterations=REPROJECT_ITERATIONS
+                ),
+                progress,
+                cancel,
+                0.80 + 0.08 * done_faces / todo_faces,
+                "Reprojetando na superfície original" + (f" (casca {k + 1} de {count})" if count > 1 else ""),
+            )
+            reps.append(rep)
+            pieces[k] = rep.mesh
+            done_faces += results[k].num_faces
+        if reps:
+            notes.extend(_reprojection_notes(reps))
     _check_cancel(cancel)
 
-    # 9b. medir; 8. pós-processo a partir dos loops achados na medição
-    _report(progress, 0.90, "Medindo a qualidade")
+    # 9. juntar e medir; 8. pós-processo a partir dos loops achados na medição
+    merged, _ = _merge(pieces, ref_input.name or mesh.name)
     measured: dict[str, Any] = {}
-    report = evaluate(
-        merged,
-        ref_clean.mesh,
-        ref_feats,
-        time_s=engine_seconds,
-        strong_threshold=threshold,
-        samples=REPORT_SAMPLES,
-        name=merged.name,
-        engine=engine_label,
-        details=measured,
+    report = _pumped(
+        lambda: evaluate(
+            merged,
+            ref_clean.mesh,
+            ref_feats,
+            time_s=engine_seconds,
+            strong_threshold=threshold,
+            samples=REPORT_SAMPLES,
+            name=merged.name,
+            engine=engine_label,
+            details=measured,
+        ),
+        progress,
+        cancel,
+        0.90,
+        "Medindo a qualidade",
     )
     match = measured.get("match")
     if match is not None and match.applicable and len(match.matched_edges):
         matched = match.matched_edges
         strong = np.asarray(match.matched_strong, dtype=bool)
         hard_edges = FeatureSet(matched[strong]).edges
-        crease_edges = FeatureSet(matched, np.where(strong, STRONG_VALUE, GUIDE_VALUE))
+        crease_edges = FeatureSet(
+            matched, np.where(strong, _strong_value(threshold), _guide_value(threshold))
+        )
     else:
         hard_edges = np.zeros((0, 2), dtype=np.int64)
         crease_edges = FeatureSet.empty()
 
-    _report(progress, 0.95, "Medindo cada casca")
     if count == 1:
         shell_reports = [report]
     else:
-        ref_shells = shell_list if same else split_shells(ref_clean.mesh, ref_feats)
-        if same:
-            ref_index = list(range(count))
-        else:
-            ref_index = _reference_shell_index(shell_list, ref_shells, ref_clean.mesh)
         share = areas / areas.sum() if areas.sum() > 0 else np.full(count, 1.0 / count)
         shell_reports = []
-        for k, out in enumerate(results):
+        for k, piece in enumerate(pieces):
             _check_cancel(cancel)
-            piece = Mesh(merged.points[offsets[k] : offsets[k + 1]], out.counts, out.connects, merged.name)
+            if status[k] != SHELL_ENGINE:  # forma exata do original: a medida geral basta
+                shell_reports.append(_unmeasured_report(piece, f"{merged.name} casca {k + 1}"))
+                continue
             ref_shell = ref_shells[ref_index[k]]
             samples = int(np.clip(REPORT_SAMPLES * share[k], MIN_SHELL_SAMPLES, REPORT_SAMPLES))
             shell_reports.append(
-                evaluate(
-                    piece,
-                    ref_shell.mesh,
-                    ref_shell.features,
-                    time_s=shell_seconds[k],
-                    strong_threshold=threshold,
-                    samples=samples,
-                    name=f"{merged.name} casca {k + 1}",
-                    engine=engine_label,
+                _pumped(
+                    lambda piece=piece, ref_shell=ref_shell, samples=samples, k=k: evaluate(
+                        piece,
+                        ref_shell.mesh,
+                        ref_shell.features,
+                        time_s=shell_seconds[k],
+                        strong_threshold=threshold,
+                        samples=samples,
+                        name=f"{merged.name} casca {k + 1}",
+                        engine=engine_label,
+                    ),
+                    progress,
+                    cancel,
+                    0.95 + 0.05 * k / count,
+                    f"Medindo a casca {k + 1} de {count}",
                 )
             )
+        # uma casca errada não pode se esconder na média do resultado geral
+        bad = [
+            k + 1
+            for k in range(count)
+            if status[k] == SHELL_ENGINE
+            and any(shell_reports[k].checks.get(key) is False for key in SHELL_REQUIRED_CHECKS)
+        ]
+        if bad:
+            report.passed = False
+            report.notes.append(
+                f"Reprovado: a(s) casca(s) {_list_shells(bad)} não passaram em quads, cobertura das creases "
+                "ou fidelidade das quinas (veja o relatório de cada casca)."
+            )
+    failed_ids = [k + 1 for k in range(count) if status[k] == SHELL_FAILED]
+    if failed_ids:
+        report.passed = False
+        report.notes.append(
+            f"Reprovado: o motor falhou na(s) casca(s) {_list_shells(failed_ids)}, que viraram quads direto."
+        )
 
     _report(progress, 1.0, "Concluído")
     return PipelineResult(
@@ -684,7 +1027,8 @@ def run_pipeline(
         seconds=time.perf_counter() - start,
         engine_seconds=engine_seconds,
         target_quads=total,
-        shell_targets=list(targets),
+        shell_targets=[0 if tiny else int(t) for t, tiny in zip(targets, small)],
+        shell_status=status,
     )
 
 
@@ -698,7 +1042,9 @@ def _maya_undo_suspended() -> Iterator[None]:
     """Não grava desfazer do trabalho temporário (cópia reduzida, malhas do motor).
 
     Tudo o que é criado aqui dentro também é apagado aqui dentro; a fila de
-    desfazer não é esvaziada e volta ao estado anterior no fim.
+    desfazer não é esvaziada e volta ao estado anterior no fim. Nada aqui
+    dentro pode processar eventos da interface: o usuário mexeria na cena sem
+    o desfazer gravar.
     """
     from maya import cmds
 
@@ -712,6 +1058,86 @@ def _maya_undo_suspended() -> Iterator[None]:
             cmds.undoInfo(stateWithoutFlush=True)
 
 
+def _maya_mirrored(transform: str) -> bool:
+    """Verdadeiro se a matriz de mundo do objeto espelha (determinante negativo, ex.: scaleX = -1).
+
+    Lida em espaço de mundo, a malha espelhada fica com as faces no sentido
+    errado (o Maya compensa isso na hora de desenhar o original).
+    """
+    from maya import cmds
+
+    matrix = np.asarray(cmds.xform(transform, query=True, worldSpace=True, matrix=True), dtype=np.float64)
+    return bool(np.linalg.det(matrix.reshape(4, 4)[:3, :3]) < 0)
+
+
+def _maya_resolve(uuid: str | None, fallback: str) -> str | None:
+    """Caminho atual do objeto (pelo UUID, que sobrevive a renomear e mudar de pai), ou ``None`` se sumiu."""
+    from maya import cmds
+
+    if uuid:
+        found = cmds.ls(uuid, long=True) or []
+        if found:
+            return found[0]
+    return fallback if cmds.objExists(fallback) else None
+
+
+def _maya_reduced_copy(transform: str, short: str, target: int) -> tuple[Mesh, FeatureSet]:
+    """Duplica o objeto, reduz a cópia para ``target`` triângulos, lê malha e creases e apaga a cópia.
+
+    Tudo sem gravar desfazer e sem processar eventos; a seleção do usuário
+    volta a ser a de antes. Falha do Reduce vira ``PipelineError`` (etapa ``reduzir``).
+    """
+    from maya import cmds
+
+    from .. import maya_bridge
+    from .cleanup import maya_reduce
+    from .creases import maya_read_creases
+
+    saved = cmds.ls(selection=True, long=True) or []
+    copy_name = None
+    with _maya_undo_suspended():
+        try:
+            copy_name = cmds.duplicate(transform, name=short + "_toptopReduzida", returnRootsOnly=True)[0]
+            try:
+                maya_reduce(maya_bridge.shape_of(copy_name), target, crease_weight=1.0, border_weight=1.0)
+            except Exception as error:
+                raise PipelineError(
+                    f"O Reduce do Maya falhou ao reduzir uma cópia para {target} triângulos: "
+                    f"{_one_line(error)}. Aumente o limite de redução na janela (Limite de redução) "
+                    "para o Maya reduzir menos, ou limpe a malha.",
+                    stage="reduzir",
+                ) from error
+            mesh = maya_bridge.mesh_from_maya(copy_name, world=True)
+            feats = maya_read_creases(copy_name)
+        finally:
+            if copy_name is not None and cmds.objExists(copy_name):
+                cmds.delete(copy_name)
+            try:
+                if saved:
+                    cmds.select(saved, replace=True)
+                else:
+                    cmds.select(clear=True)
+            except Exception:  # devolver a seleção é cortesia: nunca esconde o erro de verdade
+                pass
+    return mesh, feats
+
+
+def _maya_apply_creases(new: str, feats: FeatureSet) -> int:
+    """Grava as creases (cada valor de uma vez) nas arestas do objeto novo; devolve quantas arestas."""
+    from maya import cmds
+
+    from .. import maya_bridge
+
+    done = 0
+    for value in np.unique(feats.crease).tolist():
+        pairs = feats.edges[feats.crease == value]
+        components = maya_bridge.edge_components(new, pairs)
+        if components:
+            cmds.polyCrease(components, value=float(value))
+            done += len(pairs)
+    return done
+
+
 def maya_retopologize(
     name: str,
     options: PipelineOptions,
@@ -720,24 +1146,30 @@ def maya_retopologize(
 ) -> tuple[str, PipelineResult]:
     """Retopologiza um objeto do Maya e cria ``<nome>_toptop`` ao lado dele.
 
-    Lê a malha (espaço de mundo) e as creases; acima de ``reduce_limit``
-    triângulos, duplica o objeto, reduz a cópia, lê e apaga a cópia. Roda
-    ``run_pipeline`` com o original como referência e, num único passo de
-    desfazer, cria o objeto novo, aplica as hard edges (Game com
-    ``hard_edges``; senão tudo suave), copia o material e o seleciona. O
+    Lê a malha (espaço de mundo; objeto espelhado tem as faces desviradas) e
+    as creases. Acima de ``reduce_limit`` triângulos, valida o original (a
+    malha non-manifold sai com os culpados, antes do Reduce, que não aceita
+    non-manifold) e reduz uma cópia, sem gravar desfazer. ``run_pipeline``
+    roda com o desfazer ligado, usando o original como referência. Depois, num
+    único passo de desfazer, cria o objeto novo, aplica as hard edges (Game
+    com ``hard_edges``; senão tudo suave), grava as creases no Film, copia o
+    material e o seleciona; se algo falhar aí, o objeto novo é apagado. O
     original nunca é alterado. Devolve (transform novo, resultado).
     """
     from maya import cmds
 
     from .. import maya_bridge
-    from .cleanup import maya_reduce
     from .creases import maya_read_creases
 
     options.validate()
     transform = maya_bridge.transform_of(name)
     short = transform.split("|")[-1]
+    uuid = (cmds.ls(transform, uuid=True) or [None])[0]
     _report(progress, 0.0, "Lendo a malha do Maya")
+    mirrored = _maya_mirrored(transform)
     original = maya_bridge.mesh_from_maya(transform, world=True)
+    if mirrored:
+        original = reverse_winding(original)
     original_feats = maya_read_creases(transform)
     target = reduction_target(original, options.reduce_limit)
     base = 0.0 if target is None else 0.1
@@ -746,46 +1178,82 @@ def maya_retopologize(
     def pipeline_progress(fraction: float, message: str) -> None:
         _report(progress, base + (1.0 - base) * fraction, message)
 
-    with _maya_undo_suspended():
-        if target is None:
-            mesh, feats = original, original_feats
-            reference, reference_feats = None, None
-        else:
-            _report(progress, 0.02, f"Reduzindo uma cópia para {target} triângulos")
-            copy = cmds.duplicate(transform, name=short + "_toptopReduzida", returnRootsOnly=True)[0]
-            try:
-                maya_reduce(maya_bridge.shape_of(copy), target, crease_weight=1.0, border_weight=1.0)
-                mesh = maya_bridge.mesh_from_maya(copy, world=True)
-                feats = maya_read_creases(copy)
-            finally:
-                if cmds.objExists(copy):
-                    cmds.delete(copy)
-            reference = original
-            reference_feats = original_feats if len(original_feats) else None
-        result = run_pipeline(
-            mesh,
-            feats if len(feats) else None,
-            options,
-            reference=reference,
-            reference_features=reference_feats,
-            progress=pipeline_progress if progress else None,
-            cancel=cancel,
+    if target is None:
+        mesh, feats = original, original_feats
+        reference, reference_feats = None, None
+    else:
+        # o Reduce não aceita malha non-manifold: os culpados saem do original, antes dele
+        _pumped(
+            lambda: _clean(original, original_feats if len(original_feats) else None, options, "validar", "A malha"),
+            progress,
+            cancel,
+            0.01,
+            "Validando a malha",
         )
+        _check_cancel(cancel)
+        _report(progress, 0.02, f"Reduzindo uma cópia para {target} triângulos")
+        mesh, feats = _maya_reduced_copy(transform, short, target)
+        if mirrored:
+            mesh = reverse_winding(mesh)
+        reference = original
+        reference_feats = original_feats if len(original_feats) else None
+    _check_cancel(cancel)
+    result = run_pipeline(
+        mesh,
+        feats if len(feats) else None,
+        options,
+        reference=reference,
+        reference_features=reference_feats,
+        progress=pipeline_progress if progress else None,
+        cancel=cancel,
+    )
+    if mirrored:
+        result.notes.append("O objeto está espelhado (escala negativa): as faces foram desviradas na leitura.")
 
+    threshold = float(options.strong_threshold)
     with maya_bridge.undo_chunk("TopTop: retopologia"):
         new = maya_bridge.create_mesh(result.mesh, short + "_toptop")
-        if options.hard_edges and options.mode == "game":
-            hard = result.hard_edges
-        else:
-            hard = np.zeros((0, 2), dtype=np.int64)
-        maya_bridge.set_hard_edges(new, hard)
-        maya_bridge.copy_material(transform, new)
-        cmds.select(new, replace=True)
+        try:
+            if options.hard_edges and options.mode == "game":
+                hard = result.hard_edges
+            else:
+                hard = np.zeros((0, 2), dtype=np.int64)
+            maya_bridge.set_hard_edges(new, hard)
+            if options.mode == "film" and len(result.crease_edges):
+                written = _maya_apply_creases(new, result.crease_edges)
+                strong = int(result.crease_edges.strong_mask(threshold).sum())
+                result.notes.append(
+                    f"Creases gravadas para o Film: {written} aresta(s) de loop de feature "
+                    f"({strong} forte(s) com {_strong_value(threshold):g}, "
+                    f"{len(result.crease_edges) - strong} guia(s) com {_guide_value(threshold):g})."
+                )
+            source = _maya_resolve(uuid, transform)
+            if source is None:
+                result.notes.append("O original sumiu durante a execução: o material não foi copiado.")
+            else:
+                maya_bridge.copy_material(source, new)
+            cmds.select(new, replace=True)
+        except Exception:
+            # nada pela metade na cena: o objeto novo sai junto com o erro
+            if cmds.objExists(new):
+                cmds.delete(new)
+            raise
     return new, result
+
+
+def maya_estimate_inputs(name: str) -> tuple[float, float]:
+    """(área, diagonal) de um objeto do Maya em espaço de mundo: tudo o que a estimativa precisa.
+
+    A janela guarda isto por objeto e calcula qualquer nível e modo com
+    ``estimate_from``, sem ler a malha de novo.
+    """
+    from .. import maya_bridge
+
+    mesh = maya_bridge.mesh_from_maya(name, world=True)
+    return surface_area(mesh), mesh.diagonal()
 
 
 def maya_estimate(name: str, detail: int, mode: str = "game") -> int:
     """``estimate_quads`` direto num objeto do Maya (malha em espaço de mundo)."""
-    from .. import maya_bridge
-
-    return estimate_quads(maya_bridge.mesh_from_maya(name, world=True), detail, mode)
+    area, diagonal = maya_estimate_inputs(name)
+    return estimate_from(area, diagonal, detail, mode)

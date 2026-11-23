@@ -24,7 +24,7 @@ from toptop.core.cleanup import (
     weld_vertices,
 )
 from toptop.core.creases import FeatureSet
-from toptop.core.mesh import Mesh
+from toptop.core.mesh import Mesh, face_normals_areas, triangle_mesh
 
 
 def unwelded(mesh: Mesh) -> Mesh:
@@ -558,3 +558,155 @@ def test_clean_mesh_empty():
     assert result.mesh.num_points == 0 and result.mesh.num_faces == 0
     assert len(result.features) == 0 and result.ok
     assert result.vertex_map.tolist() == [-1, -1]
+
+
+# --------------------------------------------------------------------------
+# Solda só nas bordas, T-junctions e repetidas depois de triangular
+# --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("offset", [(1.0, 0.0, 0.0), (1.0, 1.0, 0.0), (1.0, 1.0, 1.0)])
+@pytest.mark.parametrize("tol_rel", [1e-6, 1e-2])
+def test_touching_closed_shells_stay_apart(offset, tol_rel):
+    """Dois cubos fechados que se tocam numa face, aresta ou ponta não são soldados."""
+    box = triangle_mesh(shapes.cube(1))
+    mesh = shapes.combine(box, shapes.translated(box, offset))
+    topo = mesh.topology
+    assert not topo.boundary_edge.any() and not topo.nonmanifold_edge.any()
+    welded, vmap = weld_vertices(mesh, tol_rel)
+    assert welded.num_points == 16 and vmap.tolist() == list(range(16))
+    result = clean_mesh(mesh, weld_tol_rel=tol_rel)
+    assert result.ok, result.messages
+    assert result.welded_vertices == 0 and len(result.boundary_edges) == 0
+    assert result.mesh.num_points == 16 and len(split_shells(result.mesh)) == 2
+
+
+def test_large_tolerance_never_collapses_a_closed_surface():
+    """Com 1e-2 as arestas do toro são menores que a tolerância, mas ele não tem borda: nada solda."""
+    torus = triangle_mesh(shapes.torus(200, 100))
+    edges = torus.topology.edges
+    shortest = np.linalg.norm(torus.points[edges[:, 0]] - torus.points[edges[:, 1]], axis=1).min()
+    assert shortest < 1e-2 * torus.diagonal()
+    result = clean_mesh(torus, weld_tol_rel=1e-2)
+    assert result.ok and result.welded_vertices == 0
+    assert result.mesh.num_points == torus.num_points and result.mesh.num_faces == torus.num_faces
+
+
+def test_weld_never_joins_the_two_ends_of_an_edge():
+    """Uma aresta de borda mais curta que a tolerância continua lá (só as costuras soldam)."""
+    tol_rel = 1e-3
+    pts = np.array([[0.0, 0.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    tol = tol_rel * np.sqrt(2.0)
+    pts[3] = [1.0, 0.4 * tol, 0.0]
+    mesh = Mesh.from_faces(pts, [(0, 1, 2), (1, 3, 2)])
+    welded, vmap = weld_vertices(mesh, tol_rel)
+    assert welded.num_points == 4 and vmap.tolist() == [0, 1, 2, 3]
+
+
+def _corner(points: np.ndarray, xyz: tuple[float, float, float]) -> int:
+    """Índice do vértice na posição dada."""
+    return int(np.flatnonzero(np.abs(points - np.asarray(xyz)).sum(axis=1) < 1e-12)[0])
+
+
+def _split_top_front_edge(middle: list[tuple[float, float, float]], quads: bool = False):
+    """Cubo [0,1]^3 com a quina de cima da frente dividida no lado de cima e fechada por faces planas.
+
+    A face de cima ganha os vértices ``middle`` entre a=(0,0,1) e b=(1,0,1); o
+    lado da frente continua com a aresta (a, b) e triângulos de área zero
+    fecham a fenda (como sai de uma booleana). Devolve (malha, a, b, índices do meio).
+    """
+    cube = shapes.cube(1)
+    pts = cube.points
+    a, b = _corner(pts, (0, 0, 1)), _corner(pts, (1, 0, 1))
+    mids = list(range(cube.num_points, cube.num_points + len(middle)))
+    points = np.concatenate([pts, np.asarray(middle, dtype=float).reshape(-1, 3)])
+    faces = cube.faces() if quads else triangle_mesh(cube).faces()
+    out = []
+    for face in faces:
+        n = len(face)
+        for k in range(n):
+            u, v = face[k], face[(k + 1) % n]
+            if {u, v} == {a, b} and all(points[w][2] == 1.0 for w in face):
+                chain = mids if u == a else mids[::-1]
+                face = face[: k + 1] + tuple(chain) + face[k + 1 :]
+                slivers = []
+                # leque de triângulos planos: (u, v, último), (u, último, penúltimo), ...
+                rest = [u, *chain, v]
+                for i in range(len(rest) - 2, 0, -1):
+                    slivers.append((u, rest[i + 1], rest[i]))
+                break
+        else:
+            slivers = []
+        out.append(face)
+        out.extend(slivers)
+    mesh = Mesh.from_faces(points, out)
+    return mesh, a, b, mids
+
+
+@pytest.mark.parametrize("quads", [False, True])
+def test_t_junction_cap_triangle_is_resolved_not_opened(quads):
+    """O triângulo de área zero (a, b, m) some sem abrir fenda: m entra na face vizinha."""
+    mesh, a, b, (m,) = _split_top_front_edge([(0.5, 0.0, 1.0)], quads)
+    topo = mesh.topology
+    assert not topo.boundary_edge.any() and not topo.nonmanifold_edge.any()
+    feats = FeatureSet(np.array([[a, b]]), np.array([3.0]))
+    result = clean_mesh(mesh, feats, triangulate=not quads)
+    assert result.ok and len(result.boundary_edges) == 0, result.messages
+    text = "\n".join(result.messages)
+    assert "1 face(s) de área zero (T-junction) resolvida(s)" in text and "removida" not in text
+    assert result.removed_faces == 1
+    _, areas = face_normals_areas(result.mesh)
+    assert areas.sum() == pytest.approx(6.0) and areas.min() > 1e-3
+    vm = result.vertex_map
+    assert vm[m] >= 0 and result.mesh.num_points == 9
+    # a crease que estava em (a, b) passa para (a, m) e (m, b)
+    assert pair_set(result.features.edges) == pair_set([[vm[a], vm[m]], [vm[m], vm[b]]])
+    assert result.features.crease.tolist() == [3.0, 3.0]
+    if quads:
+        assert sorted(result.mesh.counts.tolist()) == [4, 4, 4, 4, 5, 5]
+
+
+def test_chain_of_t_junction_slivers_is_resolved():
+    """Dois vértices no meio da quina e dois triângulos planos em leque: tudo fecha em duas passadas."""
+    mesh, a, b, mids = _split_top_front_edge([(0.25, 0.0, 1.0), (0.75, 0.0, 1.0)])
+    assert not mesh.topology.boundary_edge.any()
+    result = clean_mesh(mesh, FeatureSet(np.array([[a, b]]), np.array([1.0])))
+    assert result.ok and len(result.boundary_edges) == 0
+    assert any("2 face(s) de área zero (T-junction)" in m for m in result.messages)
+    _, areas = face_normals_areas(result.mesh)
+    assert areas.sum() == pytest.approx(6.0) and areas.min() > 1e-3
+    vm = result.vertex_map
+    path = [vm[a], vm[mids[0]], vm[mids[1]], vm[b]]
+    assert pair_set(result.features.edges) == pair_set(list(zip(path[:-1], path[1:])))
+
+
+def test_needle_with_zero_length_edge_collapses():
+    """Vértice repetido na mesma posição de b, ligado a b por aresta de comprimento zero: solda e some."""
+    mesh, a, b, (m,) = _split_top_front_edge([(1.0, 0.0, 1.0)])
+    assert not mesh.topology.boundary_edge.any()
+    result = clean_mesh(mesh)
+    assert result.ok and len(result.boundary_edges) == 0
+    assert result.welded_vertices == 1 and result.vertex_map[m] == result.vertex_map[b]
+    assert result.mesh.num_points == 8 and result.mesh.num_faces == 12
+
+
+def test_lone_flat_face_is_still_removed():
+    """Triângulo de área zero sem vizinho do outro lado não tem como ser resolvido: sai."""
+    plane = triangle_mesh(shapes.grid_plane(1, 1))
+    points = np.concatenate([plane.points, [[3.0, 0.0, 0.0], [4.0, 0.0, 0.0], [5.0, 0.0, 0.0]]])
+    mesh = Mesh.from_faces(points, plane.faces() + [(4, 5, 6)])
+    result = clean_mesh(mesh)
+    assert result.mesh.num_faces == 2 and result.removed_faces == 1
+    assert any("1 face(s) de área zero removida(s)" in m for m in result.messages)
+
+
+def test_quad_and_its_two_triangles_are_duplicates_after_triangulating():
+    """Um quad e os mesmos dois triângulos dele: depois de triangular viram cópias e saem."""
+    cube = shapes.cube(1)
+    q = cube.faces()[0]
+    mesh = Mesh.from_faces(cube.points, cube.faces() + [(q[0], q[1], q[2]), (q[0], q[2], q[3])])
+    result = clean_mesh(mesh)
+    assert result.ok and len(result.boundary_edges) == 0, result.messages
+    assert result.mesh.num_faces == 12 and result.removed_faces == 2
+    assert any("2 face(s) duplicada(s)" in m for m in result.messages)
+    assert set(result.face_origin.tolist()) == set(range(6))

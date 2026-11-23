@@ -148,19 +148,29 @@ ENGINES = [
 
 @pytest.fixture
 def ui(qapp, monkeypatch):
-    """(módulo da janela, Maya de mentira, estimativas pedidas) com motores e estimativa falsos."""
+    """(módulo da janela, Maya de mentira, chamadas da estimativa) com motores e estimativa falsos.
+
+    ``calls.reads`` são as leituras de malha (uma por objeto); ``calls.estimates``
+    são as contas (área, nível, modo), que não leem a malha.
+    """
     window_module = importlib.import_module("toptop.ui.window")
     scene = FakeMaya(monkeypatch)
-    estimates: list[tuple] = []
+    calls = types.SimpleNamespace(reads=[], estimates=[])
 
-    def fake_estimate(name, detail, mode="game"):
-        estimates.append((name, detail, mode))
-        return 1000 * detail * (2 if mode == "film" else 1) + (7 if name == OTHER else 0)
+    def fake_inputs(name):
+        calls.reads.append(name)
+        return (2.0 if name == OTHER else 1.0), 1.0
+
+    def fake_estimate_from(area, diagonal, detail, mode="game"):
+        calls.estimates.append((area, detail, mode))
+        return 1000 * detail * (2 if mode == "film" else 1) + (7 if area == 2.0 else 0)
 
     monkeypatch.setattr(window_module, "engine_choices", lambda: list(ENGINES))
-    monkeypatch.setattr(pl, "maya_estimate", fake_estimate)
+    monkeypatch.setattr(pl, "maya_estimate_inputs", fake_inputs)
+    monkeypatch.setattr(pl, "estimate_from", fake_estimate_from)
+    monkeypatch.setattr(pl, "maya_estimate", lambda *a, **kw: pytest.fail("a janela não lê a malha por nível"))
     monkeypatch.setattr(window_module, "_window", None)
-    yield window_module, scene, estimates
+    yield window_module, scene, calls
     window_module.close()
     for widget in qapp.topLevelWidgets():
         if widget.objectName() == window_module.OBJECT_NAME:
@@ -282,14 +292,29 @@ def test_format_result_has_report_and_notes():
     assert "Hard edges: 3 aresta(s)" in game
     assert "- Motor: aviso de teste" in game and "3.5 s no motor" in game
     film = format_result("|pCube1_toptop", result, pl.PipelineOptions(mode="film"))
-    assert "Hard edges: nenhuma" in film
+    assert "Hard edges: nenhuma" in film and "Creases: 0 aresta(s)" in film
+    assert "Creases:" not in game
+    loops = _result(crease_edges=FeatureSet(np.array([[0, 1], [1, 2], [2, 3]]), np.array([4.0, 4.0, 1.0])))
+    film = format_result("|x", loops, pl.PipelineOptions(mode="film", strong_threshold=4.0))
+    assert "Creases: 3 aresta(s) de loop de feature (2 forte(s), 1 guia(s))" in film
     shells = _result(shell_reports=[QualityReport(quads=10, passed=True), QualityReport(quads=20, passed=False)])
     text = format_result("|x", shells, pl.PipelineOptions())
     assert "1: 10 quads, APROVADA" in text and "2: 20 quads, REPROVADA" in text
+    mixed = _result(
+        shell_reports=[QualityReport(quads=10, passed=True), QualityReport(quads=3), QualityReport(quads=36)],
+        shell_status=[pl.SHELL_ENGINE, pl.SHELL_DIRECT, pl.SHELL_FAILED],
+    )
+    text = format_result("|x", mixed, pl.PipelineOptions())
+    assert "1: 10 quads, APROVADA" in text
+    assert "2: 3 quads, convertida direto (pequena demais para o motor)" in text
+    assert "3: 36 quads, o motor falhou: convertida direto" in text
 
 
 def test_engine_choices_lists_all_engines(monkeypatch):
-    """Todos os motores aparecem; um adaptador que quebra vira indisponível, sem exceção."""
+    """Todos os motores aparecem; um adaptador que quebra vira indisponível, sem exceção.
+
+    O Quad Remesher aparece sempre desligado: a licença dele não cobre uso automatizado.
+    """
     _qt()
     from toptop.engine import ENGINE_NAMES
     from toptop.ui import window as window_module
@@ -298,13 +323,24 @@ def test_engine_choices_lists_all_engines(monkeypatch):
     assert [c[0] for c in choices] == list(ENGINE_NAMES)
     assert all(isinstance(c[2], bool) and c[3] for c in choices)
     assert choices[0][1] == "QuadWild Bi-MDF"
+    by_name = {c[0]: c for c in choices}
+    _, label, ok, why = by_name["quadremesher"]
+    assert label == "Quad Remesher" and ok is False
+    assert "licença" in why and "prepare_manual" in why and "collect_manual" in why
+
+    # mesmo com o plugin "instalado", ele continua desligado na janela
+    from toptop.engine import quadremesher
+
+    monkeypatch.setattr(quadremesher.QuadRemesherEngine, "availability", lambda self: (True, "plugin achado"))
+    assert {c[0]: c[2] for c in window_module.engine_choices()}["quadremesher"] is False
 
     def broken(name, **kw):
         raise RuntimeError("quebrado")
 
     monkeypatch.setattr(window_module, "get_engine", broken)
     choices = window_module.engine_choices()
-    assert all(not ok and "quebrado" in why for _, _, ok, why in choices)
+    assert all(not ok for _, _, ok, _ in choices)
+    assert all("quebrado" in why for name, _, _, why in choices if name != "quadremesher")
 
 
 # --------------------------------------------------------------------------
@@ -358,7 +394,12 @@ def test_window_controls_and_defaults(win):
     options = window.options()
     assert (options.mode, options.detail, options.strong_threshold, options.hard_edges) == ("game", 5, 2.0, True)
     assert (options.suggest_angle, options.engine, options.symmetry) == (30.0, "quadwild", None)
+    assert options.reduce_limit == 100_000 and window.reduce_spin.value() == 100_000
     options.validate()
+    # o limite de redução que a mensagem de erro manda aumentar está na janela
+    window.reduce_spin.setValue(250_000)
+    assert window.options().reduce_limit == 250_000
+    assert window.reduce_spin.objectName() == "toptopReduceLimit"
 
     # um callback SelectionChanged ligado
     assert [event for event, _ in scene.callbacks.values()] == ["SelectionChanged"]
@@ -379,32 +420,33 @@ def test_no_available_engine_disables_run(ui, monkeypatch):
 
 
 def test_target_follows_selection_and_estimate(win):
-    """O alvo segue a seleção; a estimativa muda com alvo, nível e modo, com cache."""
-    window, scene, estimates = win
-    assert estimates == [(TARGET, 5, "game")]
+    """O alvo segue a seleção; a malha é lida uma vez por objeto e nível/modo só refazem a conta."""
+    window, scene, calls = win
+    assert calls.reads == [TARGET] and calls.estimates == [(1.0, 5, "game")]
 
     scene.fire_selection(OTHER)
     assert window.target == OTHER and window.target_label.text() == "pSphere1"
     window.update_estimate()
-    assert estimates[-1] == (OTHER, 5, "game")
+    assert calls.reads == [TARGET, OTHER]
     assert window.estimate_label.text() == "≈ 5.007 quads"
 
     window.detail_slider.setValue(8)
     assert window.detail_value.text() == "8"
     window.update_estimate()
-    assert estimates[-1] == (OTHER, 8, "game") and window.estimate_label.text() == "≈ 8.007 quads"
+    assert calls.estimates[-1] == (2.0, 8, "game") and window.estimate_label.text() == "≈ 8.007 quads"
 
     window.mode_film.setChecked(True)
     assert window.mode() == "film"
     assert not window.hard_edges_check.isEnabled()
     window.update_estimate()
-    assert estimates[-1] == (OTHER, 8, "film") and window.estimate_label.text() == "≈ 16.007 quads"
+    assert calls.estimates[-1] == (2.0, 8, "film") and window.estimate_label.text() == "≈ 16.007 quads"
 
-    count = len(estimates)
     window.mode_game.setChecked(True)
-    window.update_estimate()
-    assert len(estimates) == count  # (OTHER, 8, game) já estava no cache
+    for detail in range(DETAIL_MIN, DETAIL_MAX + 1):
+        window.detail_slider.setValue(detail)
+        window.update_estimate()
     assert window.hard_edges_check.isEnabled()
+    assert calls.reads == [TARGET, OTHER]  # nível e modo nunca releem a malha
 
     scene.fire_selection(None)
     assert window.target is None and window.target_label.text() == "(selecione uma malha)"
@@ -416,27 +458,28 @@ def test_target_follows_selection_and_estimate(win):
 
 
 def test_estimate_timer_coalesces_changes(win, qapp):
-    """Mexer no slider várias vezes seguidas faz uma leitura só, depois da pausa."""
+    """Mexer no slider várias vezes seguidas faz uma conta só, depois da pausa (e nenhuma leitura)."""
     from PySide6 import QtTest
 
-    window, _, estimates = win
-    count = len(estimates)
+    window, _, calls = win
+    count = len(calls.estimates)
     for value in (6, 7, 8, 9):
         window.detail_slider.setValue(value)
-    assert len(estimates) == count
+    assert len(calls.estimates) == count
     QtTest.QTest.qWait(3 * window._estimate_timer.interval())
-    assert estimates[count:] == [(TARGET, 9, "game")]
+    assert calls.estimates[count:] == [(1.0, 9, "game")]
+    assert calls.reads == [TARGET]
 
 
 def test_estimate_error_shows_question_mark(win, monkeypatch):
     """Se a estimativa falhar, o rótulo mostra '?' e a janela segue funcionando."""
-    window, _, _ = win
+    window, scene, _ = win
 
     def boom(*a, **kw):
         raise ValueError("objeto sumiu")
 
-    monkeypatch.setattr(pl, "maya_estimate", boom)
-    window.detail_slider.setValue(2)
+    monkeypatch.setattr(pl, "maya_estimate_inputs", boom)
+    scene.fire_selection(OTHER)  # objeto novo: a leitura acontece (e falha)
     window.update_estimate()
     assert window.estimate_label.text() == "≈ ? quads"
     assert "objeto sumiu" in window.estimate_label.toolTip()
@@ -674,6 +717,43 @@ def test_retopologize_errors_never_escape(win, monkeypatch, error, expected):
         assert "Traceback" in window.report()
     if isinstance(error, EngineTimeout):
         assert "C:/tmp/qw" in window.report()
+
+
+def test_actions_reread_the_target_after_rename(win, monkeypatch):
+    """Renomear ou mudar de pai não dispara SelectionChanged: os botões releem o alvo antes de agir."""
+    window, scene, _ = win
+    renamed = "|grupo|pCube1Novo"
+    scene.selected = renamed  # sem chamar os callbacks, como o Maya faz num rename
+    assert window.target == TARGET
+    seen = []
+
+    def fake_suggest(name, angle_deg=30.0, select=True):
+        seen.append(("suggest", name))
+        return np.zeros((0, 2), dtype=np.int64)
+
+    def fake_check(name, angle_deg=30.0, strong_threshold=2.0):
+        seen.append(("check", name))
+        return check_input(shapes.cube(1), FeatureSet(creases_module.suggest_creases(shapes.cube(1), 30.0)))
+
+    def fake_retopo(name, options, progress=None, cancel=None):
+        seen.append(("retopo", name))
+        raise EngineCancelled("parou")
+
+    monkeypatch.setattr(creases_module, "maya_suggest", fake_suggest)
+    monkeypatch.setattr(creases_module, "maya_check", fake_check)
+    monkeypatch.setattr(pl, "maya_retopologize", fake_retopo)
+    window.suggest_button.click()
+    window.check_button.click()
+    window.run_button.click()
+    assert seen == [("suggest", renamed), ("check", renamed), ("retopo", renamed)]
+    assert window.target == renamed and window.target_label.text() == "pCube1Novo"
+    assert "Erro inesperado" not in window.report()
+
+    # a seleção esvaziou sem callback: os botões não agem num caminho velho
+    scene.selected = None
+    window.retopologize()
+    assert seen[-1] == ("retopo", renamed) and len(seen) == 3
+    assert not window.run_button.isEnabled()
 
 
 def test_close_removes_callback(win, qapp):

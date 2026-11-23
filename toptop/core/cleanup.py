@@ -1,8 +1,9 @@
 """Validar, limpar, separar cascas e reduzir a malha de entrada (passos 1 a 3 do plano).
 
-1. **Validar e limpar**: tudo trabalha numa cópia; solda vértices duplicados,
-   remove faces degeneradas, de área zero e repetidas, aponta o que é
-   non-manifold e triangula. Bordas abertas viram feature guia sozinhas.
+1. **Validar e limpar**: tudo trabalha numa cópia; solda as costuras abertas
+   (só vértices de borda), remove faces degeneradas e repetidas, fecha as
+   T-junctions de área zero, aponta o que é non-manifold e triangula. Bordas
+   abertas viram feature guia sozinhas.
 2. **Separar cascas**: cada casca conectada é processada sozinha.
 3. **Reduzir se preciso**: acima do limite de triângulos, ``maya_reduce`` roda o
    ``polyReduce`` novo preservando creases, hard edges e bordas.
@@ -191,8 +192,21 @@ def close_pairs(points: np.ndarray, tol: float) -> np.ndarray:
     return np.stack([np.minimum(a, b), np.maximum(a, b)], axis=1).astype(np.int64)
 
 
+def _pair_keys(a: np.ndarray, b: np.ndarray, base: int) -> np.ndarray:
+    """Chave única de cada par não ordenado (menor * base + maior)."""
+    return np.minimum(a, b) * base + np.maximum(a, b)
+
+
 def weld_vertices(mesh: Mesh, tol_rel: float = DEFAULT_WELD_TOL_REL) -> tuple[Mesh, np.ndarray]:
-    """Solda os vértices mais próximos que ``tol_rel * diagonal``.
+    """Fecha as costuras abertas: solda vértices de borda mais próximos que ``tol_rel * diagonal``.
+
+    Só vértices de **borda aberta** da entrada se juntam pela tolerância (ou
+    por coordenadas idênticas): cascas fechadas que só se encostam (peças de
+    kitbash lado a lado) continuam separadas e manifold, e uma superfície
+    fechada nunca desmorona pelas próprias arestas. Dois vértices ligados por
+    uma aresta também não se juntam pela tolerância; só uma aresta de
+    comprimento zero (pontas idênticas) colapsa. Uma malha toda desoldada tem
+    todo vértice na borda, então ela solda por inteiro.
 
     A relação é transitiva (uma cadeia de vértices próximos vira um só). Cada
     grupo fica na posição do seu vértice de menor índice. Vértices sem face são
@@ -202,21 +216,50 @@ def weld_vertices(mesh: Mesh, tol_rel: float = DEFAULT_WELD_TOL_REL) -> tuple[Me
     """
     vertex_map = np.full(mesh.num_points, -1, dtype=np.int64)
     used_ids = np.flatnonzero(_used_mask(mesh))
+    num = len(used_ids)
+    if num == 0:
+        empty = np.zeros(0, dtype=np.int64)
+        return Mesh(np.zeros((0, 3)), empty, empty.copy(), mesh.name), vertex_map
     pts = mesh.points[used_ids]
-    group, first = _exact_groups(pts)
-    reps = pts[first]
+    topo = mesh.topology
+    local = np.full(mesh.num_points, -1, dtype=np.int64)
+    local[used_ids] = np.arange(num, dtype=np.int64)
+    edges = local[topo.edges[~topo.degenerate_edge]]
+    border = np.flatnonzero(topo.boundary_vertex[used_ids])
+    parts: list[np.ndarray] = []
 
-    finite = np.flatnonzero(np.isfinite(reps).all(axis=1))
-    pairs = np.zeros((0, 2), dtype=np.int64)
+    # 1. vértices de borda com coordenadas idênticas (agrupados antes, para a
+    # busca por tolerância não ver milhares de cópias do mesmo ponto)
+    rep_of = np.arange(num, dtype=np.int64)
+    reps = border
+    if border.size:
+        group, first = _exact_groups(pts[border])
+        rep_of[border] = border[first[group]]
+        reps = border[first]
+        parts.append(np.stack([border, rep_of[border]], axis=1))
+
+    # 2. arestas de comprimento zero colapsam (estejam ou não na borda)
+    if len(edges):
+        zero = (pts[edges[:, 0]] == pts[edges[:, 1]]).all(axis=1)
+        parts.append(edges[zero])
+
+    # 3. vértices de borda próximos, menos os ligados por uma aresta
+    finite_all = np.isfinite(pts).all(axis=1)
+    finite = reps[finite_all[reps]]
     if len(finite) > 1 and tol_rel > 0:
-        fin = reps[finite]
-        tol = float(tol_rel) * float(np.linalg.norm(fin.max(axis=0) - fin.min(axis=0)))
-        pairs = finite[close_pairs(fin, tol)]
-    roots = connected_labels(len(reps), pairs)
+        fin_all = pts[finite_all]
+        tol = float(tol_rel) * float(np.linalg.norm(fin_all.max(axis=0) - fin_all.min(axis=0)))
+        cand = finite[close_pairs(pts[finite], tol)]
+        if len(cand) and len(edges):
+            linked = _pair_keys(rep_of[edges[:, 0]], rep_of[edges[:, 1]], num)
+            cand = cand[~np.isin(_pair_keys(cand[:, 0], cand[:, 1], num), linked)]
+        parts.append(cand)
+
+    pairs = np.concatenate(parts) if parts else np.zeros((0, 2), dtype=np.int64)
+    roots = connected_labels(num, pairs)
     kept_roots, cluster = np.unique(roots, return_inverse=True)
-    cluster = cluster.reshape(-1).astype(np.int64)
-    vertex_map[used_ids] = cluster[group]
-    out = Mesh(reps[kept_roots], mesh.counts.copy(), vertex_map[mesh.connects], mesh.name)
+    vertex_map[used_ids] = cluster.reshape(-1).astype(np.int64)
+    out = Mesh(pts[kept_roots], mesh.counts.copy(), vertex_map[mesh.connects], mesh.name)
     return out, vertex_map
 
 
@@ -250,18 +293,18 @@ def _duplicate_faces(mesh: Mesh, candidates: np.ndarray) -> np.ndarray:
     return dup
 
 
-def _remove_degenerate(mesh: Mesh, area_tol_rel: float) -> tuple[Mesh, np.ndarray, tuple[int, int, int]]:
-    """Versão de ``remove_degenerate_faces`` que também conta cada motivo.
+def _collapse_repeats(mesh: Mesh) -> tuple[Mesh, np.ndarray]:
+    """Tira vértices repetidos em sequência e as faces com menos de 3 vértices distintos.
 
-    Os contadores são (menos de 3 vértices distintos, área zero, duplicadas).
+    Devolve a malha das faces que ficaram (os vértices não mudam) e a máscara
+    das faces de entrada que ficaram.
     """
     nf = mesh.num_faces
     if nf == 0:
-        return Mesh(mesh.points, mesh.counts, mesh.connects, mesh.name), np.ones(0, dtype=bool), (0, 0, 0)
+        return Mesh(mesh.points, mesh.counts, mesh.connects, mesh.name), np.ones(0, dtype=bool)
     connects = mesh.connects
     corner_face = np.repeat(np.arange(nf, dtype=np.int64), mesh.counts)
-
-    # 1. vértice repetido em sequência (inclusive o último igual ao primeiro)
+    # vértice repetido em sequência (inclusive o último igual ao primeiro)
     keep_corner = connects != connects[_corner_next(mesh)]
     new_counts = np.bincount(corner_face[keep_corner], minlength=nf).astype(np.int64)
     alive = new_counts >= 3
@@ -273,21 +316,177 @@ def _remove_degenerate(mesh: Mesh, area_tol_rel: float) -> tuple[Mesh, np.ndarra
         keys = np.unique(corner_face[sel] * base + connects[sel])
         distinct = np.bincount(keys // base, minlength=nf)
         alive &= ~big | (distinct >= 3)
-    collapsed = int((~alive).sum())
-
     mid = Mesh(mesh.points, new_counts[alive], connects[keep_corner & alive[corner_face]], mesh.name)
-    # 2. área zero (Newell), relativa à diagonal da malha de entrada
+    return mid, alive
+
+
+def _keep_faces(mesh: Mesh, keep: np.ndarray) -> Mesh:
+    """Malha só com as faces marcadas (os vértices não mudam)."""
+    return Mesh(mesh.points, mesh.counts[keep], mesh.connects[np.repeat(keep, mesh.counts)], mesh.name)
+
+
+def _remove_degenerate(mesh: Mesh, area_tol_rel: float) -> tuple[Mesh, np.ndarray, tuple[int, int, int]]:
+    """Versão de ``remove_degenerate_faces`` que também conta cada motivo.
+
+    Os contadores são (menos de 3 vértices distintos, área zero, duplicadas).
+    """
+    nf = mesh.num_faces
+    mid, alive = _collapse_repeats(mesh)
+    if nf == 0:
+        return mid, alive, (0, 0, 0)
+    collapsed = int((~alive).sum())
+    # área zero (Newell), relativa à diagonal da malha de entrada
     _, areas = face_normals_areas(mid)
     diag = mesh.diagonal()
     flat = areas <= float(area_tol_rel) * diag * diag
-    # 3. duplicadas: mesmo conjunto de vértices, qualquer rotação ou sentido
+    # duplicadas: mesmo conjunto de vértices, qualquer rotação ou sentido
     dup = _duplicate_faces(mid, ~flat)
 
     keep_mid = ~flat & ~dup
     keep = np.zeros(nf, dtype=bool)
     keep[np.flatnonzero(alive)[keep_mid]] = True
-    out = Mesh(mesh.points, mid.counts[keep_mid], mid.connects[np.repeat(keep_mid, mid.counts)], mesh.name)
-    return out, keep, (collapsed, int(flat.sum()), int(dup.sum()))
+    return _keep_faces(mid, keep_mid), keep, (collapsed, int(flat.sum()), int(dup.sum()))
+
+
+#: passadas no máximo para resolver faces de área zero encadeadas
+_MAX_FLAT_PASSES = 64
+
+
+def _flat_insertions(
+    mesh: Mesh, flat: np.ndarray
+) -> tuple[dict[int, np.ndarray | None], list[list[int]]]:
+    """Planeja como resolver cada face de área zero sem abrir buraco (T-junction).
+
+    A face plana (a, b, x1, ..., xk) tem os vértices em linha: a aresta mais
+    comprida (a, b) liga as pontas e o caminho b -> x1 -> ... -> xk -> a volta
+    por cima dela. Esse caminho entra no lugar da aresta (a, b) na face vizinha
+    do outro lado e a face plana sai: a malha continua fechada e a vizinha só
+    ganha os vértices do meio. Devolve {face: novo laço} para as vizinhas e
+    {face: None} para as planas resolvidas (cada face entra em no máximo uma
+    troca) e, para cada aresta (a, b) que sumiu, o caminho [b, x1, ..., xk, a]
+    que a substitui.
+    """
+    topo = mesh.topology
+    off, con, pts = mesh.offsets, mesh.connects, mesh.points
+    touched = np.zeros(mesh.num_faces, dtype=bool)
+    changes: dict[int, np.ndarray | None] = {}
+    splits: list[list[int]] = []
+    for f in np.flatnonzero(flat).tolist():
+        if touched[f]:
+            continue
+        loop = con[off[f] : off[f + 1]]
+        n = len(loop)
+        p = pts[loop]
+        dist = np.linalg.norm(p[:, None, :] - p[None, :, :], axis=2)
+        i, j = (int(v) for v in np.unravel_index(int(np.argmax(dist)), dist.shape))
+        if not dist[i, j] > 0:
+            continue
+        if (i + 1) % n == j:
+            start = i
+        elif (j + 1) % n == i:
+            start = j
+        else:
+            continue  # as pontas não são vizinhas no laço: zigue-zague, não dá para resolver
+        a, b = int(loop[start]), int(loop[(start + 1) % n])
+        chain = [int(loop[(start + 1 + k) % n]) for k in range(1, n - 1)]
+        # o caminho de b até a tem de andar sempre para a frente sobre (b, a)
+        ba = pts[a] - pts[b]
+        t = (pts[chain] - pts[b]) @ ba / float(ba @ ba)
+        eps = 1e-9
+        if t.min() < -eps or t.max() > 1.0 + eps or (np.diff(t) < -eps).any():
+            continue
+        e = int(topo.edge_ids(np.array([[a, b]]))[0])
+        if e < 0 or topo.edge_face_count[e] != 2:
+            continue
+        g = int(topo.edge_faces[e, 1] if topo.edge_faces[e, 0] == f else topo.edge_faces[e, 0])
+        if g == f or flat[g] or touched[g]:
+            continue
+        other = con[off[g] : off[g + 1]].tolist()
+        if any(x in other for x in chain):
+            continue
+        m = len(other)
+        new = None
+        for q in range(m):
+            nxt = other[(q + 1) % m]
+            if other[q] == b and nxt == a:  # vizinha no mesmo sentido: b -> x1 ... xk -> a
+                new = other[: q + 1] + chain + other[q + 1 :]
+                break
+            if other[q] == a and nxt == b:  # vizinha invertida: a -> xk ... x1 -> b
+                new = other[: q + 1] + chain[::-1] + other[q + 1 :]
+                break
+        if new is None:
+            continue
+        changes[f] = None
+        changes[g] = np.asarray(new, dtype=np.int64)
+        touched[f] = touched[g] = True
+        splits.append([b, *chain, a])
+    return changes, splits
+
+
+def _apply_face_changes(
+    mesh: Mesh, origin: np.ndarray, changes: dict[int, np.ndarray | None], triangulate: bool
+) -> tuple[Mesh, np.ndarray]:
+    """Aplica as trocas de ``_flat_insertions`` (com ``origin`` acompanhando cada face).
+
+    As faces novas vão para o fim; com ``triangulate`` elas já saem trianguladas.
+    """
+    keep = np.ones(mesh.num_faces, dtype=bool)
+    keep[list(changes)] = False
+    loops = [(g, loop) for g, loop in changes.items() if loop is not None]
+    counts = [mesh.counts[keep]]
+    connects = [mesh.connects[np.repeat(keep, mesh.counts)]]
+    new_origin = [origin[keep]]
+    if loops:
+        extra = Mesh(
+            mesh.points,
+            np.array([len(loop) for _, loop in loops], dtype=np.int64),
+            np.concatenate([loop for _, loop in loops]),
+            mesh.name,
+        )
+        extra_origin = origin[np.array([g for g, _ in loops], dtype=np.int64)]
+        if triangulate:
+            tris, tri_face = triangulate_faces(extra)
+            extra = Mesh(mesh.points, np.full(len(tris), 3, dtype=np.int64), tris.reshape(-1), mesh.name)
+            extra_origin = extra_origin[tri_face]
+        counts.append(extra.counts)
+        connects.append(extra.connects)
+        new_origin.append(extra_origin)
+    out = Mesh(mesh.points, np.concatenate(counts), np.concatenate(connects), mesh.name)
+    return out, np.concatenate(new_origin).astype(np.int64)
+
+
+def _fix_flat_faces(
+    mesh: Mesh, origin: np.ndarray, area_tol: float, triangulate: bool
+) -> tuple[Mesh, np.ndarray, int, int, list[list[int]]]:
+    """Resolve as faces de área zero que dá (``_flat_insertions``) e tira o resto.
+
+    Devolve a malha, a face de entrada de cada face, quantas faces planas foram
+    resolvidas (T-junction fechada), quantas foram só removidas e os caminhos
+    que substituíram as arestas que sumiram (na ordem em que foram feitos).
+    """
+    resolved = 0
+    splits: list[list[int]] = []
+    for _ in range(_MAX_FLAT_PASSES):
+        if mesh.num_faces == 0:
+            break
+        _, areas = face_normals_areas(mesh)
+        flat = areas <= area_tol
+        if not flat.any():
+            break
+        changes, done = _flat_insertions(mesh, flat)
+        if not changes:
+            break
+        mesh, origin = _apply_face_changes(mesh, origin, changes, triangulate)
+        resolved += len(done)
+        splits.extend(done)
+    removed = 0
+    if mesh.num_faces:
+        _, areas = face_normals_areas(mesh)
+        flat = areas <= area_tol
+        removed = int(flat.sum())
+        if removed:
+            mesh, origin = _keep_faces(mesh, ~flat), origin[~flat]
+    return mesh, origin, resolved, removed, splits
 
 
 def remove_degenerate_faces(
@@ -378,13 +577,35 @@ class CleanResult:
         return len(self.nonmanifold_edges) == 0 and len(self.nonmanifold_vertices) == 0
 
 
+def _expand_split(u: int, v: int, path_of: dict[tuple[int, int], list[int]]) -> np.ndarray:
+    """Arestas que substituem o par (u, v) depois das T-junctions resolvidas (o próprio par se nada mudou).
+
+    Um caminho pode ter sido dividido de novo depois; a troca segue até o fim.
+    """
+    out: list[tuple[int, int]] = []
+    stack = [(u, v)]
+    budget = 4 * (len(path_of) + 1)  # proteção contra ciclo
+    while stack and budget > 0:
+        budget -= 1
+        a, b = stack.pop()
+        path = path_of.get((min(a, b), max(a, b)))
+        if path is None:
+            out.append((a, b))
+        else:
+            stack.extend(zip(path[:-1], path[1:]))
+    return np.array(out, dtype=np.int64).reshape(-1, 2)
+
+
 def _remap_features(
-    features: FeatureSet, vertex_map: np.ndarray, mesh: Mesh
+    features: FeatureSet, vertex_map: np.ndarray, mesh: Mesh, splits: list[list[int]] | None = None
 ) -> tuple[FeatureSet, int, int]:
     """Renumera as features para a malha limpa.
 
-    Devolve as features que são arestas da malha limpa, quantas sumiram na
-    solda (as duas pontas viraram um vértice só) e quantas não são arestas.
+    ``splits`` (numeração da malha limpa) são os caminhos que substituíram
+    arestas nas T-junctions resolvidas: a feature numa dessas arestas passa
+    para as arestas do caminho, com o mesmo crease. Devolve as features que
+    são arestas da malha limpa, quantas sumiram na solda (as duas pontas
+    viraram um vértice só) e quantas não são arestas.
     """
     if len(features) == 0:
         return FeatureSet.empty(), 0, 0
@@ -396,8 +617,22 @@ def _remap_features(
     collapsed = valid & (mapped[:, 0] == mapped[:, 1])
     candidate = valid & ~collapsed
     on_mesh = np.zeros(len(edges), dtype=bool)
-    on_mesh[candidate] = mesh.topology.edge_ids(mapped[candidate]) >= 0
+    topo = mesh.topology
+    on_mesh[candidate] = topo.edge_ids(mapped[candidate]) >= 0
     kept = FeatureSet(mapped[on_mesh], features.crease[on_mesh])
+    missing = np.flatnonzero(candidate & ~on_mesh)
+    if splits and missing.size:
+        path_of = {(min(p[0], p[-1]), max(p[0], p[-1])): p for p in splits}
+        extra_pairs, extra_values = [], []
+        for i in missing.tolist():
+            sub = _expand_split(int(mapped[i, 0]), int(mapped[i, 1]), path_of)
+            ok = topo.edge_ids(sub) >= 0
+            if ok.any():
+                on_mesh[i] = True
+                extra_pairs.append(sub[ok])
+                extra_values.append(np.full(int(ok.sum()), features.crease[i]))
+        if extra_pairs:
+            kept = kept.merged(FeatureSet(np.concatenate(extra_pairs), np.concatenate(extra_values)))
     return kept, int(collapsed.sum()), int((~collapsed & ~on_mesh).sum())
 
 
@@ -412,6 +647,12 @@ def clean_mesh(
 ) -> CleanResult:
     """Limpa uma cópia da malha: solda, tira faces ruins, triangula e aponta non-manifold.
 
+    Ordem: solda as bordas abertas; tira as faces com menos de 3 vértices
+    distintos e os polígonos repetidos; triangula; resolve as faces de área
+    zero (uma T-junction vira um vértice a mais na face vizinha, sem abrir
+    buraco; só sai a que não dá para resolver); tira de novo as faces repetidas
+    (um quad e os seus dois triângulos viram cópias depois de triangular).
+
     As features (na numeração da malha de entrada) são renumeradas; as que
     somem na solda ou não são arestas da malha limpa caem e são contadas nas
     mensagens. As bordas abertas entram como feature guia com crease
@@ -425,19 +666,39 @@ def clean_mesh(
     unused = mesh.num_points - used_count
     welded_count = used_count - welded.num_points
 
-    tidy, keep, (collapsed, flat, dup) = _remove_degenerate(welded, area_tol_rel)
-    face_origin = np.flatnonzero(keep).astype(np.int64)
+    # 1. menos de 3 vértices distintos e polígonos repetidos (antes de triangular:
+    # duas cópias do mesmo quad podem ser cortadas por diagonais diferentes)
+    tidy, alive = _collapse_repeats(welded)
+    collapsed = int((~alive).sum())
+    face_origin = np.flatnonzero(alive).astype(np.int64)
+    dup_mask = _duplicate_faces(tidy, np.ones(tidy.num_faces, dtype=bool))
+    dup = int(dup_mask.sum())
+    tidy, face_origin = _keep_faces(tidy, ~dup_mask), face_origin[~dup_mask]
+    # 2. triangulação
     if triangulate and tidy.num_faces:
         tris, tri_face = triangulate_faces(tidy)
         tidy = Mesh(tidy.points, np.full(len(tris), 3, dtype=np.int64), tris.reshape(-1), tidy.name)
         face_origin = face_origin[tri_face]
+    # 3. área zero (também a criada pela triangulação): T-junction vira vértice na
+    # face vizinha; só sai o que não dá para resolver
+    diag = welded.diagonal()
+    tidy, face_origin, resolved, flat, splits = _fix_flat_faces(
+        tidy, face_origin, float(area_tol_rel) * diag * diag, triangulate
+    )
+    # 4. repetidas de novo: um quad e os dois triângulos dele viram cópias depois de triangular
+    dup_mask = _duplicate_faces(tidy, np.ones(tidy.num_faces, dtype=bool))
+    dup += int(dup_mask.sum())
+    tidy, face_origin = _keep_faces(tidy, ~dup_mask), face_origin[~dup_mask]
     clean, compact_map = compact_vertices(tidy)
     vertex_map = np.full(mesh.num_points, -1, dtype=np.int64)
     has = weld_map >= 0
     vertex_map[has] = compact_map[weld_map[has]]
 
     feats, lost_weld, not_edges = _remap_features(
-        features if features is not None else FeatureSet.empty(), vertex_map, clean
+        features if features is not None else FeatureSet.empty(),
+        vertex_map,
+        clean,
+        [compact_map[np.asarray(p, dtype=np.int64)].tolist() for p in splits],
     )
     nm_edges, nm_vertices = nonmanifold_report(clean)
     topo = clean.topology
@@ -451,6 +712,10 @@ def clean_mesh(
         messages.append(f"{welded_count} vértice(s) duplicado(s) soldado(s).")
     if collapsed:
         messages.append(f"{collapsed} face(s) com menos de 3 vértices distintos removida(s).")
+    if resolved:
+        messages.append(
+            f"{resolved} face(s) de área zero (T-junction) resolvida(s): o vértice do meio entrou na face vizinha."
+        )
     if flat:
         messages.append(f"{flat} face(s) de área zero removida(s).")
     if dup:
@@ -476,7 +741,7 @@ def clean_mesh(
         features=feats,
         vertex_map=vertex_map,
         welded_vertices=int(welded_count),
-        removed_faces=int((~keep).sum()),
+        removed_faces=int(mesh.num_faces - np.unique(face_origin).size),
         nonmanifold_edges=nm_edges,
         nonmanifold_vertices=nm_vertices,
         boundary_edges=borders,
