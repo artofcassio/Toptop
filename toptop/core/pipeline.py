@@ -938,7 +938,10 @@ def run_pipeline(
             notes.extend(_reprojection_notes(reps))
     _check_cancel(cancel)
 
-    # 9. juntar e medir; 8. pós-processo a partir dos loops achados na medição
+    # 9. juntar e medir; 8. pós-processo a partir dos loops achados na medição.
+    # Vértice sem face sai antes: o Maya o descartaria ao criar o objeto e as
+    # hard edges, creases e cores (por índice) cairiam nos vértices errados.
+    pieces = [compact_vertices(piece)[0] for piece in pieces]
     merged, _ = _merge(pieces, ref_input.name or mesh.name)
     measured: dict[str, Any] = {}
     report = _pumped(

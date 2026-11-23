@@ -325,12 +325,16 @@ def maya_read_creases(mesh_name: str) -> FeatureSet:
     from .. import maya_bridge
 
     fn = maya_bridge.mesh_fn(mesh_name)
-    edge_ids, values = fn.getCreaseEdges()
-    if len(edge_ids) == 0:
+    try:
+        edge_ids, values = fn.getCreaseEdges()
+    except RuntimeError:  # algumas versões falham (kFailure) em vez de devolver listas vazias
         return FeatureSet.empty()
-    pairs = maya_bridge.edge_vertex_pairs(mesh_name)
     ids = np.asarray(list(edge_ids), dtype=np.int64)
-    return FeatureSet(pairs[ids], np.asarray(list(values), dtype=np.float64))
+    values = np.asarray(list(values), dtype=np.float64)
+    keep = values > 0  # crease 0 gravado à mão não é feature
+    if not keep.any():
+        return FeatureSet.empty()
+    return FeatureSet(maya_bridge.edge_vertex_pairs(mesh_name, ids[keep]), values[keep])
 
 
 def maya_read_hard_edges(mesh_name: str) -> np.ndarray:

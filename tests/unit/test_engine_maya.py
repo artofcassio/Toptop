@@ -43,18 +43,21 @@ class FakeMaya:
         self.calls = []
         self.fail = fail
         self.result = shapes.cube(3)
+        self.roots = ["|pCube1"]  # objetos na raiz da cena (cmds.ls(assemblies=True))
+        self.created = {}  # objeto -> malha, para um polyRetopo que cria objeto novo
         cmds = types.ModuleType("maya.cmds")
         cmds.help = lambda name: help_text
         cmds.about = lambda **kw: batch
         cmds.objExists = lambda name: True
         cmds.delete = lambda *a, **kw: self.calls.append(("delete", a))
+        cmds.ls = lambda **kw: list(self.roots)
         cmds.polyRetopo = self._retopo
         maya = types.ModuleType("maya")
         maya.cmds = cmds
         bridge = types.ModuleType("toptop.maya_bridge")
-        bridge.create_mesh = lambda mesh, name: self.calls.append(("create", mesh.num_faces, name)) or "|tmp"
+        bridge.create_mesh = self._create
         bridge.set_hard_edges = lambda name, pairs: self.calls.append(("hard", len(pairs)))
-        bridge.mesh_from_maya = lambda name, world=True: self.result
+        bridge.mesh_from_maya = lambda name, world=True: self.created[name] if name in self.created else self.result
         monkeypatch.setitem(sys.modules, "maya", maya)
         monkeypatch.setitem(sys.modules, "maya.cmds", cmds)
         monkeypatch.setitem(sys.modules, "toptop.maya_bridge", bridge)
@@ -62,10 +65,16 @@ class FakeMaya:
 
         monkeypatch.setattr(toptop, "maya_bridge", bridge, raising=False)
 
+    def _create(self, mesh, name):
+        self.calls.append(("create", mesh.num_faces, name))
+        self.roots.append("|tmp")
+        return "|tmp"
+
     def _retopo(self, node, **flags):
         self.calls.append(("retopo", node, flags))
         if self.fail:
             raise RuntimeError("Retopologize failed")
+        self.roots.extend(self.created)
 
 
 def test_registry_and_unavailable_outside_maya():
@@ -145,3 +154,21 @@ def test_quadremesher_is_manual_in_batch_and_explains_missing_names(monkeypatch)
     with pytest.raises(EngineError, match="doRemeshNow"):
         engine._entry_point()
     assert QuadRemesherEngine(module_name="fake_qr_plugin", method_name="doRemeshNow")._entry_point() is plugin.doRemeshNow
+
+
+def test_retopo_reads_a_new_object_when_replace_original_is_ignored(monkeypatch):
+    """Se o polyRetopo deixar a temporária intacta e criar outro objeto, o resultado vem dele e ele é apagado."""
+    mesh = shapes.cube(2)
+    fake = FakeMaya(monkeypatch)
+    fake.result = mesh  # a temporária continua igual à entrada
+    fake.created = {"|tmpRetopo": shapes.cube(4)}
+    result = MayaRetopoEngine().remesh(mesh, None, 300)
+    assert result.num_faces == shapes.cube(4).num_faces
+    deleted = [c[1][0] for c in fake.calls if c[0] == "delete"]
+    assert deleted == ["|tmp", "|tmpRetopo"]  # nada do motor fica na cena; o que já existia não é tocado
+
+    fake = FakeMaya(monkeypatch)
+    fake.result = mesh
+    with pytest.raises(EngineError, match="sem mudar a malha"):
+        MayaRetopoEngine().remesh(mesh, None, 300)
+    assert [c[1][0] for c in fake.calls if c[0] == "delete"] == ["|tmp"]

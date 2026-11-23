@@ -147,6 +147,8 @@ class MayaRetopoEngine(Engine):
 
         start = time.perf_counter()
         temp = None
+        roots_before = set(cmds.ls(assemblies=True, long=True) or [])
+        created: list[str] = []
         try:
             if progress is not None:
                 progress(0.05, "Retopologize: preparando a malha")
@@ -155,7 +157,11 @@ class MayaRetopoEngine(Engine):
             if progress is not None:
                 progress(0.1, "Retopologize: calculando (não dá para cancelar)")
             cmds.polyRetopo(temp, **flags)
+            created = [n for n in cmds.ls(assemblies=True, long=True) or [] if n not in roots_before and n != temp]
             result = maya_bridge.mesh_from_maya(temp, world=True)
+            if _same_mesh(result, mesh):
+                # replaceOriginal não pegou: a malha nova, se existir, é um objeto novo na cena
+                result = self._read_created(created, mesh)
         except EngineError:
             raise
         except Exception as error:
@@ -163,8 +169,9 @@ class MayaRetopoEngine(Engine):
             info.log = str(error)
             raise EngineError(f"o polyRetopo falhou: {error}", log=str(error)) from error
         finally:
-            if temp is not None and cmds.objExists(temp):
-                cmds.delete(temp)
+            for node in ([temp] if temp is not None else []) + created:
+                if cmds.objExists(node):
+                    cmds.delete(node)
         info.seconds = time.perf_counter() - start
         if result.num_faces == 0:
             raise EngineError("o polyRetopo devolveu uma malha vazia")
@@ -173,3 +180,30 @@ class MayaRetopoEngine(Engine):
         if progress is not None:
             progress(1.0, "Retopologize concluído")
         return Mesh(result.points, result.counts, result.connects, mesh.name)
+
+    @staticmethod
+    def _read_created(created: list[str], mesh: Mesh) -> Mesh:
+        """Malha que o ``polyRetopo`` criou como objeto separado (quando não substituiu a temporária)."""
+        from .. import maya_bridge
+
+        for node in created:
+            try:
+                candidate = maya_bridge.mesh_from_maya(node, world=True)
+            except ValueError:  # não é malha
+                continue
+            if candidate.num_faces and not _same_mesh(candidate, mesh):
+                return candidate
+        raise EngineError(
+            "o polyRetopo terminou sem mudar a malha (replaceOriginal não foi aplicado e nenhum objeto "
+            "novo com a malha refeita apareceu na cena)"
+        )
+
+
+def _same_mesh(a: Mesh, b: Mesh) -> bool:
+    """Mesma topologia e mesmos pontos: o comando não mexeu na malha."""
+    return (
+        a.num_points == b.num_points
+        and np.array_equal(a.counts, b.counts)
+        and np.array_equal(a.connects, b.connects)
+        and np.allclose(a.points, b.points)
+    )

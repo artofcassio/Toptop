@@ -71,14 +71,18 @@ def mesh_from_maya(name: str, world: bool = True) -> Mesh:
     return Mesh(points, np.array(counts, dtype=np.int64), np.array(connects, dtype=np.int64), short)
 
 
-def edge_vertex_pairs(name: str) -> np.ndarray:
-    """(E, 2) vértices de cada aresta, na numeração de arestas do Maya."""
+def edge_vertex_pairs(name: str, ids=None) -> np.ndarray:
+    """(E, 2) vértices de cada aresta, na numeração de arestas do Maya.
+
+    Com ``ids``, só dessas arestas (bem mais rápido numa malha grande, já que
+    a API responde uma aresta por chamada).
+    """
     fn = mesh_fn(name)
-    count = fn.numEdges
-    pairs = np.empty((count, 2), dtype=np.int64)
+    wanted = range(fn.numEdges) if ids is None else [int(i) for i in ids]
+    pairs = np.empty((len(wanted), 2), dtype=np.int64)
     get = fn.getEdgeVertices
-    for i in range(count):
-        pairs[i] = get(i)
+    for row, i in enumerate(wanted):
+        pairs[row] = get(i)
     return pairs
 
 
@@ -124,7 +128,10 @@ def select_edges(name: str, pairs: np.ndarray) -> int:
 def create_mesh(mesh: Mesh, name: str = "toptop_mesh") -> str:
     """Cria um objeto novo no Maya com a geometria de ``mesh``; devolve o transform.
 
-    Os vértices e as faces ficam na mesma ordem dos arrays.
+    Os vértices e as faces ficam na mesma ordem dos arrays: hard edges,
+    creases e cores gravadas depois usam esses índices. Por isso a malha não
+    pode ter vértice sem face (o Maya o descartaria e a numeração andaria);
+    se o Maya mudar a contagem mesmo assim, o objeto é apagado e o erro sobe.
     """
     transform = cmds.createNode("transform", name=name, skipSelect=True)
     selection = om.MSelectionList()
@@ -132,7 +139,13 @@ def create_mesh(mesh: Mesh, name: str = "toptop_mesh") -> str:
     parent = selection.getDependNode(0)
     points = om.MPointArray([om.MPoint(x, y, z) for x, y, z in mesh.points.tolist()])
     try:
-        om.MFnMesh().create(points, mesh.counts.tolist(), mesh.connects.tolist(), parent=parent)
+        fn = om.MFnMesh()
+        fn.create(points, mesh.counts.tolist(), mesh.connects.tolist(), parent=parent)
+        if fn.numVertices != mesh.num_points or fn.numPolygons != mesh.num_faces:
+            raise RuntimeError(
+                f"o Maya criou {fn.numVertices} vértices e {fn.numPolygons} faces, mas a malha tem "
+                f"{mesh.num_points} e {mesh.num_faces}: a numeração mudou (vértice sem face ou face inválida)"
+            )
     except Exception:
         cmds.delete(transform)
         raise
