@@ -71,8 +71,15 @@ def cylinder(name, radius, height, sides, center=(0.0, 0.0, 0.0), axis=(0, 1, 0)
 
 
 def boolean(a, b, operation, name):
-    """Booleana sem histórico; apaga o que sobrar dos operandos."""
+    """Booleana sem histórico; apaga o que sobrar dos operandos.
+
+    Os operandos são avaliados antes (``polyEvaluate``): no Maya 2026 sem
+    interface, o ``polyCBoolOp`` sobre peças recém-criadas e movidas, ainda não
+    avaliadas, devolve geometria errada (furos sem parede, tampas sobrando).
+    """
     cmds = _cmds()
+    cmds.polyEvaluate(a, face=True)
+    cmds.polyEvaluate(b, face=True)
     result = cmds.polyCBoolOp(a, b, op=operation, ch=False, n=name)[0]
     cmds.delete(result, ch=True)
     for leftover in (a, b):
@@ -182,6 +189,22 @@ def mark_creases(node, angle=30.0, guide_planes=()):
         cmds.polyCrease(guide_components, value=GUIDE)
     cmds.delete(node, ch=True)
     return int(strong.sum()), int(guide.sum())
+
+
+def check_edges_match(node):
+    """Erro se o Maya tem arestas repetidas (duas ligando os mesmos vértices).
+
+    O TopTop identifica a aresta pelo par de vértices; com arestas repetidas os
+    creases cairiam nas arestas erradas. Acontece quando uma booleana deixa uma
+    tampa sobrando e o ``polyMergeVertex`` solda os vértices sem juntar as arestas.
+    """
+    from toptop import maya_bridge
+
+    maya_edges = int(_cmds().polyEvaluate(node, edge=True))
+    ours = len(maya_bridge.mesh_from_maya(node).topology.edges)
+    if maya_edges != ours:
+        raise RuntimeError(f"{node}: o Maya tem {maya_edges} arestas e o TopTop lê {ours} "
+                           f"(arestas repetidas: booleana malfeita)")  # fmt: skip
 
 
 def from_arrays(name, points, faces):
@@ -402,6 +425,7 @@ def export_model(node, name, title, options, out_dir):
 
     cmds = _cmds()
     node = cmds.rename(node, "modelo_" + name)  # nome de nó do Maya não pode começar com dígito
+    check_edges_match(node)
     strong, guide = mark_creases(node, options.get("angle", 30.0), options.get("guide_planes", ()))
 
     scene = os.path.abspath(os.path.join(out_dir, name + ".mb"))
@@ -549,5 +573,6 @@ if __name__ == "__main__":
         maya.standalone.initialize(name="python")
         code = main()
     finally:
-        sys.stdout.flush()
-        os._exit(code)  # o encerramento normal do Maya standalone às vezes trava
+        from toptop.core.phase0 import exit_now
+
+        exit_now(code)  # a limpeza do Maya standalone quebra ao sair (Windows)

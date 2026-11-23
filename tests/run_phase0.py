@@ -155,8 +155,7 @@ def worker_main(job_path: str) -> None:
                    target_quads=spec.target_quads, message=f"falha no processo do Maya: {error}")  # fmt: skip
     with open(job["result"], "w", encoding="utf-8") as handle:
         json.dump(row, handle)
-    sys.stdout.flush()
-    os._exit(0)  # o encerramento normal do Maya standalone às vezes trava
+    phase0.exit_now(0)  # a limpeza do Maya standalone quebra ao sair (Windows)
 
 
 def run_in_worker(spec: phase0.ModelSpec, engine: str, args: argparse.Namespace) -> dict:
@@ -341,9 +340,7 @@ if __name__ == "__main__":
     try:
         code = main()
     finally:
-        # o encerramento normal do Maya standalone às vezes trava: sai direto
+        # a limpeza do Maya standalone quebra ao sair (Windows): sai direto
         if have_maya() and getattr(init_maya, "done", False):
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(code)
+            phase0.exit_now(code)
     sys.exit(code)

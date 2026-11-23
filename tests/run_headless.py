@@ -236,7 +236,5 @@ if __name__ == "__main__":
         code = main()
     finally:
         if run_phase0.have_maya() and getattr(run_phase0.init_maya, "done", False):
-            sys.stdout.flush()
-            sys.stderr.flush()
-            os._exit(code)
+            phase0.exit_now(code)  # a limpeza do Maya standalone quebra ao sair (Windows)
     sys.exit(code)

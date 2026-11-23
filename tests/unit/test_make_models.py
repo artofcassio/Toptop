@@ -80,3 +80,42 @@ def test_previous_items_without_manifest_uses_obj_files(gen, tmp_path):
 
 def test_ten_models_listed(gen):
     assert [name[:2] for name, _, _ in gen.MODELS] == [f"{i:02d}" for i in range(1, 11)]
+
+
+class _FakeCmds:
+    """cmds falso que registra as chamadas, na ordem."""
+
+    def __init__(self, edges=0):
+        self.calls, self.edges = [], edges
+
+    def __getattr__(self, name):
+        def call(*args, **kwargs):
+            self.calls.append((name, args))
+            if name == "polyCBoolOp":
+                return ["resultado"]
+            if name == "polyEvaluate":
+                return self.edges
+            if name == "objExists":
+                return False
+            return None
+
+        return call
+
+
+def test_boolean_evaluates_both_operands_first(gen, monkeypatch):
+    fake = _FakeCmds()
+    monkeypatch.setattr(gen, "_cmds", lambda: fake)
+    assert gen.boolean("corpo", "furo", gen.DIFFERENCE, "r") == "resultado"
+    names = [name for name, _ in fake.calls]
+    first_bool = names.index("polyCBoolOp")
+    evaluated = {args[0] for name, args in fake.calls[:first_bool] if name == "polyEvaluate"}
+    assert evaluated == {"corpo", "furo"}  # Maya 2026: sem isso a booleana sai errada
+
+
+def test_check_edges_match_rejects_repeated_edges(gen, fake_bridge, monkeypatch):
+    fake_bridge["placa"] = _box(2, 1, 1)
+    monkeypatch.setattr(gen, "_cmds", lambda: _FakeCmds(edges=12))
+    gen.check_edges_match("placa")  # cubo: 12 arestas nos dois
+    monkeypatch.setattr(gen, "_cmds", lambda: _FakeCmds(edges=15))
+    with pytest.raises(RuntimeError):
+        gen.check_edges_match("placa")

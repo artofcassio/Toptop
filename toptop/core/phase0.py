@@ -376,3 +376,28 @@ def summary_text(rows: list[dict[str, Any]]) -> str:
     else:
         lines.append("Nenhum motor passou no portão: pelo plano, o projeto para e é reavaliado.")
     return "\n".join(lines)
+
+
+def exit_now(code: int) -> None:
+    """Encerra o processo do ``mayapy`` na hora, sem a limpeza do Maya.
+
+    No Windows (Maya 2026), sair com ``os._exit`` roda a limpeza das DLLs do Maya,
+    que quebra (``TnClothShape::sCleanupClass``) e deixa um ``*[Recovered...].ma``
+    no Temp a cada execução. ``TerminateProcess`` não roda essa limpeza. Os arquivos
+    já foram gravados e fechados antes; só falta esvaziar o console.
+    """
+    import sys
+
+    for stream in (sys.stdout, sys.stderr):
+        try:
+            stream.flush()
+        except (AttributeError, ValueError, OSError):
+            pass
+    if os.name == "nt":
+        import ctypes
+
+        kernel32 = ctypes.windll.kernel32  # type: ignore[attr-defined]
+        kernel32.GetCurrentProcess.restype = ctypes.c_void_p
+        kernel32.TerminateProcess.argtypes = [ctypes.c_void_p, ctypes.c_uint]
+        kernel32.TerminateProcess(kernel32.GetCurrentProcess(), code & 0xFFFFFFFF)
+    os._exit(code)

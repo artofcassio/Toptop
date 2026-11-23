@@ -3,6 +3,7 @@
 import csv
 import json
 import os
+import sys
 
 import numpy as np
 import pytest
@@ -154,3 +155,12 @@ def test_csv_json_and_summary(tmp_path):
     assert data["gate"]["chosen"] == "a" and len(data["results"]) == 2 and data["targets"]["hausdorff_max"] == 0.005
     text = phase0.summary_text(rows)
     assert "PASSOU" in text and "QUALIFICA" in text and "Motor escolhido pelas métricas: a" in text
+
+
+def test_exit_now_ends_the_process_with_the_code():
+    import subprocess
+
+    script = "import sys; sys.path.insert(0, %r); from toptop.core.phase0 import exit_now; print('ok'); exit_now(7)"
+    root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    done = subprocess.run([sys.executable, "-c", script % root], capture_output=True, text=True, timeout=60)
+    assert done.returncode == 7 and done.stdout.strip() == "ok"
