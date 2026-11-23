@@ -1,0 +1,18 @@
+[project]
+name = "toptop"
+version = "0.1.0"
+description = "Retopologia automática de hard surface para Maya: 100% quads, cada crease vira edge loop."
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = ["numpy"]
+
+[project.optional-dependencies]
+dev = ["pytest"]
+
+[tool.setuptools.packages.find]
+include = ["toptop*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests/unit"]
+pythonpath = [".", "tests/unit"]
+addopts = "-q"
