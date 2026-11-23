@@ -1198,3 +1198,26 @@ def test_real_quadwild_with_stray_triangle_and_flat_shell(tmp_path):
     assert report.quad_ratio == 1.0 and report.shells == 3
     assert report.crease_coverage > 0.99 and report.hausdorff < 1e-3
     assert report.passed, (report.checks, report.notes)
+
+
+def test_heatmap_data_follows_the_result():
+    """Desvio por vértice alinhado com a malha do resultado; cores na escala da meta."""
+    from toptop.core.creases import suggest_creases
+    from toptop.core.pipeline import heatmap_colors
+
+    ref = triangle_mesh(shapes.cube(1))
+    feats = FeatureSet(suggest_creases(ref, 30.0))
+    result = run_pipeline(ref, feats, PipelineOptions(engine=FakeEngine()))
+    assert len(result.vertex_deviation) == result.mesh.num_points
+    assert result.heat_scale == pytest.approx(0.005 * ref.diagonal())
+    assert float(result.vertex_deviation.max()) < 1e-6  # reprojetado: tudo sobre o cubo
+    colors = heatmap_colors(result)
+    assert colors.shape == (result.mesh.num_points, 3)
+    assert np.allclose(colors, [0.0, 0.2, 1.0])  # tudo azul
+    far = result.vertex_deviation.copy()
+    far[0] = 1.0
+    result.vertex_deviation = far
+    assert np.allclose(heatmap_colors(result)[0], [1.0, 0.0, 0.0])
+    result.vertex_deviation = far[:3]
+    with pytest.raises(ValueError):
+        heatmap_colors(result)

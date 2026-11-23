@@ -446,9 +446,17 @@ class TopTopWindow(QtWidgets.QWidget):
         self.run_button.setObjectName("toptopRun")
         self.cancel_button = QtWidgets.QPushButton("Cancelar")
         self.cancel_button.setEnabled(False)
+        self.heatmap_button = QtWidgets.QPushButton("Mapa de calor")
+        self.heatmap_button.setObjectName("toptopHeatmap")
+        self.heatmap_button.setCheckable(True)
+        self.heatmap_button.setToolTip(
+            "Pinta o resultado pelo desvio até o original: azul = em cima da superfície, "
+            "vermelho = na meta de desvio (0,5% da diagonal) ou acima. Clique de novo para esconder."
+        )
         buttons.addWidget(self.check_button)
         buttons.addWidget(self.run_button)
         buttons.addWidget(self.cancel_button)
+        buttons.addWidget(self.heatmap_button)
         root.addLayout(buttons)
 
         self.progress_bar = QtWidgets.QProgressBar()
@@ -476,6 +484,7 @@ class TopTopWindow(QtWidgets.QWidget):
         self.check_button.clicked.connect(self.check_input)
         self.run_button.clicked.connect(self.retopologize)
         self.cancel_button.clicked.connect(self.request_cancel)
+        self.heatmap_button.clicked.connect(self.toggle_heatmap)
         self.engine_combo.currentIndexChanged.connect(self._update_buttons)
 
     def _fill_engines(self) -> None:
@@ -567,6 +576,7 @@ class TopTopWindow(QtWidgets.QWidget):
         self.guide_button.setEnabled(idle)
         self.run_button.setEnabled(idle and has_target and engine_ok)
         self.cancel_button.setEnabled(self._running)
+        self.heatmap_button.setEnabled(idle and self.last_result is not None and self.last_new is not None)
         self.engine_combo.setEnabled(idle)
         if not engine_ok:
             self.run_button.setToolTip(f"Motor indisponível: {engine_why}")
@@ -803,6 +813,7 @@ class TopTopWindow(QtWidgets.QWidget):
             self._error(f"Erro inesperado: {exc}\n\n{traceback.format_exc()}")
         else:
             self.last_new, self.last_result = new, result
+            self.heatmap_button.setChecked(False)
             self.progress_bar.setValue(PROGRESS_STEPS)
             self.status_label.setText("Pronto.")
             self._set_report(format_result(new, result, options))
@@ -813,6 +824,26 @@ class TopTopWindow(QtWidgets.QWidget):
         if self._target_dirty:
             self.refresh_target()
         self.schedule_estimate()  # o slider pode ter mexido durante a execução
+
+    def toggle_heatmap(self) -> None:
+        """"Mapa de calor": pinta (ou despinta) o último objeto criado pelo desvio até o original."""
+        new, result = self.last_new, self.last_result
+        if new is None or result is None:
+            self.heatmap_button.setChecked(False)
+            return
+        show = self.heatmap_button.isChecked()
+        try:
+            if show:
+                pipeline.maya_show_heatmap(new, result)
+                self.status_label.setText(
+                    "Mapa de calor: azul = sobre o original, vermelho = na meta de desvio ou acima."
+                )
+            else:
+                pipeline.maya_hide_heatmap(new)
+                self.status_label.setText("Mapa de calor escondido.")
+        except Exception as exc:
+            self.heatmap_button.setChecked(False)
+            self._error(f"Não foi possível mostrar o mapa de calor em {new.split('|')[-1]}: {exc}")
 
     # ------------------------------------------------------------ fechamento
 

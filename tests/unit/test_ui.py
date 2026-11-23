@@ -1002,3 +1002,27 @@ def test_shelf_uses_only_existing_flags():
         assert {"create", "edit"} <= set(flags[name]["modes"]), name
     assert "query" in flags["docTag"]["modes"] and "query" in reference["shelfLayout"]["flags"]["childArray"]["modes"]
     assert "edit" in reference["shelfTabLayout"]["flags"]["selectTab"]["modes"]
+
+
+def test_heatmap_button_after_a_run(win, monkeypatch):
+    """O mapa de calor só liga depois de um resultado e alterna mostrar/esconder."""
+    window, _, _ = win
+    assert not window.heatmap_button.isEnabled()
+    result = _result(vertex_deviation=np.zeros(shapes.cube(10).num_points), heat_scale=0.01)
+    monkeypatch.setattr(pl, "maya_retopologize", lambda name, options, progress=None, cancel=None: ("|pCube1_toptop", result))
+    calls = []
+    monkeypatch.setattr(pl, "maya_show_heatmap", lambda name, res: calls.append(("show", name, res)))
+    monkeypatch.setattr(pl, "maya_hide_heatmap", lambda name: calls.append(("hide", name)))
+    window.run_button.click()
+    assert window.heatmap_button.isEnabled() and not window.heatmap_button.isChecked()
+    window.heatmap_button.click()
+    assert calls == [("show", "|pCube1_toptop", result)] and window.heatmap_button.isChecked()
+    window.heatmap_button.click()
+    assert calls[-1] == ("hide", "|pCube1_toptop") and not window.heatmap_button.isChecked()
+
+    def broken(name, res):
+        raise RuntimeError("objeto apagado")
+
+    monkeypatch.setattr(pl, "maya_show_heatmap", broken)
+    window.heatmap_button.click()
+    assert not window.heatmap_button.isChecked() and "objeto apagado" in window.report()

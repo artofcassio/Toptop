@@ -65,7 +65,7 @@ from .creases import (
 )
 from .geom import point_grid
 from .mesh import Mesh, face_centers
-from .quality import QualityReport, evaluate, face_counts, match_features
+from .quality import QualityReport, Targets, evaluate, face_counts, heat_colors, match_features, vertex_deviation
 from .reproject import KIND_CORNER, KIND_CURVE, KIND_SURFACE, KIND_UNTOUCHED, ReprojectResult
 from .reproject import reproject as reproject_mesh
 
@@ -252,6 +252,10 @@ class PipelineResult:
     #: ``SHELL_ENGINE``, ``SHELL_DIRECT`` (pequena demais: quads direto) ou
     #: ``SHELL_FAILED`` (o motor falhou: quads direto) para cada casca
     shell_status: list[str] = field(default_factory=list)
+    #: distância de cada vértice do resultado até a superfície original (mapa de calor)
+    vertex_deviation: np.ndarray = field(default_factory=lambda: np.zeros(0))
+    #: distância que vira vermelho no mapa de calor: a meta de desvio da forma
+    heat_scale: float = 0.0
 
 
 # --------------------------------------------------------------------------
@@ -954,6 +958,13 @@ def run_pipeline(
         0.90,
         "Medindo a qualidade",
     )
+    deviation = _pumped(
+        lambda: vertex_deviation(merged, ref_clean.mesh),
+        progress,
+        cancel,
+        0.94,
+        "Calculando o mapa de calor",
+    )
     match = measured.get("match")
     if match is not None and match.applicable and len(match.matched_edges):
         matched = match.matched_edges
@@ -1029,7 +1040,18 @@ def run_pipeline(
         target_quads=total,
         shell_targets=[0 if tiny else int(t) for t, tiny in zip(targets, small)],
         shell_status=status,
+        vertex_deviation=deviation,
+        heat_scale=Targets().hausdorff_max * ref_clean.mesh.diagonal(),
     )
+
+
+def heatmap_colors(result: PipelineResult) -> np.ndarray:
+    """Cores RGB (0-1) por vértice do resultado: azul = no original, vermelho = na meta de desvio ou acima."""
+    deviation = np.asarray(result.vertex_deviation, dtype=np.float64)
+    if len(deviation) != result.mesh.num_points:
+        raise ValueError("o resultado não tem o desvio por vértice (rode o pipeline de novo)")
+    scale = result.heat_scale if result.heat_scale > 0 else float(deviation.max(initial=0.0)) or 1.0
+    return heat_colors(deviation, scale)
 
 
 # --------------------------------------------------------------------------
@@ -1257,3 +1279,25 @@ def maya_estimate(name: str, detail: int, mode: str = "game") -> int:
     """``estimate_quads`` direto num objeto do Maya (malha em espaço de mundo)."""
     area, diagonal = maya_estimate_inputs(name)
     return estimate_from(area, diagonal, detail, mode)
+
+
+def maya_show_heatmap(name: str, result: PipelineResult) -> None:
+    """Pinta o objeto criado pela retopologia com o mapa de calor de desvio.
+
+    As cores vão num color set próprio (``toptopDesvio``) e a exibição de cor
+    de vértice é ligada; ``maya_hide_heatmap`` desliga. As cores são gravadas
+    pela API e não entram no desfazer: para escondê-las, use
+    ``maya_hide_heatmap`` (o botão da janela alterna entre os dois).
+    """
+    from .. import maya_bridge
+
+    maya_bridge.set_vertex_colors(name, heatmap_colors(result))
+
+
+def maya_hide_heatmap(name: str) -> None:
+    """Desliga a exibição das cores de vértice (o color set continua no objeto)."""
+    from maya import cmds
+
+    from .. import maya_bridge
+
+    cmds.setAttr(maya_bridge.shape_of(name) + ".displayColors", 0)
