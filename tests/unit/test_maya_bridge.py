@@ -166,8 +166,15 @@ def test_estimate_inputs_ask_maya_instead_of_reading_the_mesh(bridge, monkeypatc
     cmds = sys.modules["maya.cmds"]
     cmds.polyEvaluate = lambda shape, worldArea: 24.0
     cmds.exactWorldBoundingBox = lambda shape: [0.0, 0.0, 0.0, 2.0, 2.0, 1.0]
+    cmds.currentUnit = lambda **kw: "cm"
     monkeypatch.setattr(module, "mesh_from_maya", lambda *a, **kw: pytest.fail("leu a malha inteira"))
     assert pipeline.maya_estimate_inputs("obj") == (24.0, 3.0)
+    # Maya 2026: a área vem em cm² e a caixa na unidade da cena (cena em mm: 30 mm = 3 cm)
+    cmds.polyEvaluate = lambda shape, worldArea: 24.0
+    cmds.exactWorldBoundingBox = lambda shape: [0.0, 0.0, 0.0, 20.0, 20.0, 10.0]
+    cmds.currentUnit = lambda **kw: "mm"
+    assert pipeline.maya_estimate_inputs("obj") == pytest.approx((24.0, 3.0))
+    cmds.currentUnit = lambda **kw: "cm"
 
     cmds.polyEvaluate = lambda shape, worldArea: "Nothing counted : no polygonal object is selected."
     cube = shapes.cube(1, size=2.0)

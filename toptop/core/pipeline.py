@@ -1266,6 +1266,10 @@ def maya_retopologize(
     return new, result
 
 
+# centímetros por unidade linear do Maya (``currentUnit -q -linear``)
+CM_PER_UNIT = {"mm": 0.1, "cm": 1.0, "m": 100.0, "km": 100000.0, "in": 2.54, "ft": 30.48, "yd": 91.44, "mi": 160934.4}
+
+
 def maya_estimate_inputs(name: str) -> tuple[float, float]:
     """(área, diagonal) de um objeto do Maya em espaço de mundo: tudo o que a estimativa precisa.
 
@@ -1273,7 +1277,10 @@ def maya_estimate_inputs(name: str) -> tuple[float, float]:
     ``estimate_from``, sem ler a malha de novo. Roda a cada troca de seleção,
     por isso pede área e caixa ao próprio Maya (rápido em qualquer tamanho)
     em vez de copiar a malha para o Python; a estimativa só usa a razão
-    área / diagonal², então a unidade da cena não importa.
+    área / diagonal². Atenção às unidades: o ``polyEvaluate -worldArea`` responde
+    em cm² (unidade interna) e o ``exactWorldBoundingBox`` na unidade da cena;
+    numa cena em mm a estimativa saía 100 vezes menor. A caixa é convertida
+    para cm; unidade desconhecida lê a malha (sempre em cm).
     """
     from maya import cmds
 
@@ -1281,11 +1288,12 @@ def maya_estimate_inputs(name: str) -> tuple[float, float]:
 
     shape = maya_bridge.shape_of(name)
     try:
+        cm_per_unit = CM_PER_UNIT.get(str(cmds.currentUnit(query=True, linear=True)).lower())
         area = cmds.polyEvaluate(shape, worldArea=True)
         box = cmds.exactWorldBoundingBox(shape)
-        if isinstance(area, (int, float)) and box and len(box) == 6:
+        if cm_per_unit and isinstance(area, (int, float)) and box and len(box) == 6:
             low, high = np.asarray(box[:3], dtype=np.float64), np.asarray(box[3:], dtype=np.float64)
-            return float(area), float(np.linalg.norm(high - low))
+            return float(area), float(np.linalg.norm(high - low)) * cm_per_unit
     except RuntimeError:
         pass
     # o polyEvaluate devolve texto quando não consegue contar: lê a malha
