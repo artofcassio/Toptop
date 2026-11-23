@@ -12,6 +12,7 @@ from toptop.core.mesh import (
     face_centers,
     face_normals_areas,
     shells,
+    subdivide_triangles,
     triangle_mesh,
     triangulate,
 )
@@ -123,3 +124,21 @@ def test_connected_labels_long_chain():
     rng = np.random.default_rng(1)
     labels = connected_labels(n, edges[rng.permutation(n - 1)])
     assert (labels == 0).all()
+
+
+def test_subdivide_triangles_keeps_shape_and_creases():
+    from toptop.core.creases import suggest_creases
+
+    base = triangle_mesh(shapes.cube(1))
+    dense, origin = subdivide_triangles(base, 2)
+    assert dense.num_faces == 12 * 16
+    assert np.array_equal(dense.points[:8], base.points)
+    _, area = face_normals_areas(dense)
+    assert area.sum() == pytest.approx(6.0)
+    topo = dense.topology
+    assert not topo.boundary_edge.any() and not topo.nonmanifold_edge.any()
+    assert dense.num_points - topo.num_edges + dense.num_faces == 2
+    assert len(suggest_creases(dense, 30.0)) == 12 * 4  # cada quina dividida em 4
+    assert (origin[:8] == np.arange(8)[:, None]).all() and (origin < 8).all()
+    same, _ = subdivide_triangles(base, 0)
+    assert np.array_equal(same.connects, base.connects)

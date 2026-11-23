@@ -358,3 +358,39 @@ def extract_faces(mesh: Mesh, face_mask: np.ndarray) -> tuple[Mesh, np.ndarray]:
     old_ids, new_connects = np.unique(mesh.connects[corner_mask], return_inverse=True)
     sub = Mesh(mesh.points[old_ids], mesh.counts[face_mask], new_connects.reshape(-1), mesh.name)
     return sub, old_ids
+
+
+def subdivide_triangles(mesh: Mesh, levels: int = 1) -> tuple[Mesh, np.ndarray]:
+    """Subdivisão linear (sem suavizar): cada triângulo vira 4, a forma não muda.
+
+    Devolve a malha nova e, para cada vértice, um par de vértices originais da
+    aresta onde ele nasceu (o próprio índice, duas vezes, para os que já
+    existiam; aproximado a partir do segundo nível). Os vértices antigos mantêm
+    o índice.
+    """
+    tris = triangle_mesh(mesh).connects.reshape(-1, 3)
+    points = mesh.points
+    origin = np.stack([np.arange(len(points)), np.arange(len(points))], axis=1).astype(np.int64)
+    for _ in range(max(0, int(levels))):
+        n = len(points)
+        pairs = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
+        lo, hi = pairs.min(axis=1), pairs.max(axis=1)
+        keys, inverse = np.unique(lo * n + hi, return_inverse=True)
+        inverse = inverse.reshape(-1)
+        ea, eb = keys // n, keys % n
+        points = np.concatenate([points, 0.5 * (points[ea] + points[eb])])
+        origin = np.concatenate([origin, np.stack([origin[ea, 0], origin[eb, 1]], axis=1)])
+        m = len(tris)
+        mid = n + inverse
+        m01, m12, m20 = mid[:m], mid[m : 2 * m], mid[2 * m :]
+        a, b, c = tris[:, 0], tris[:, 1], tris[:, 2]
+        tris = np.concatenate(
+            [
+                np.stack([a, m01, m20], axis=1),
+                np.stack([m01, b, m12], axis=1),
+                np.stack([m20, m12, c], axis=1),
+                np.stack([m01, m12, m20], axis=1),
+            ]
+        )
+    out = Mesh(points, np.full(len(tris), 3, dtype=np.int64), tris.reshape(-1), mesh.name)
+    return out, origin
